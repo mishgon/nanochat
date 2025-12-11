@@ -129,6 +129,10 @@ class DistMuon(torch.optim.Optimizer):
         world_size = dist.get_world_size()
 
         # Ensure all grads exist
+        for group in self.param_groups:
+            for p in group["params"]:
+                if p.grad is None:
+                    p.grad = torch.zeros_like(p)
         assert all(p.grad is not None for group in self.param_groups for p in group["params"]), "All params must have grads"
 
         # Kick off all the reduce scatter operations to average up the gradients across all ranks

@@ -21,7 +21,7 @@ from collections import defaultdict
 import torch
 from torch.utils.tensorboard import SummaryWriter
 
-from nanochat.gpt import GPT, GPTConfig
+from nanochat.gpt_moe import GPTMoE, GPTMoEConfig
 from nanochat.dataloader import tokenizing_distributed_data_loader, tokenizing_distributed_data_loader_with_state
 from nanochat.common import compute_init, compute_cleanup, print0, DummyWandb, print_banner, get_base_dir, autodetect_device_type
 from nanochat.tokenizer import get_tokenizer, get_token_bytes
@@ -39,12 +39,15 @@ device_type = "" # cuda|cpu|mps (empty => autodetect good device type default, i
 # Model architecture
 depth = 12 # the depth of the Transformer model to train, rest of the kwargs are derived
 max_seq_len = 1024 # max context length
+num_experts = 8
+max_experts_per_token = 2
+alpha = 0.01
 # Training horizon. Only one of these 3 will be used, in this order of precedence.
 num_iterations = -1 # explicit number of steps of the optimization (-1 = disable)
 target_flops = -1.0 # calculate num_iterations to reach target_flops. Useful for scaling laws experiments (-1 = disable)
 target_param_data_ratio = 20 # calculate num_iterations to maintain fixed data:param ratio (Chinchilla=20) (-1 = disable)
 # Optimization
-device_batch_size = 128 # per-device batch size (set to not OOM)
+device_batch_size = 64 # per-device batch size (set to not OOM)
 total_batch_size = 524288 # total desired batch size, in #tokens
 embedding_lr = 0.2 # learning rate for the embedding parameters (Adam)
 unembedding_lr = 0.004 # learning rate for the unembedding parameters (Adam)
@@ -63,7 +66,7 @@ core_metric_max_per_task = 500 # examples per task in estimating the core metric
 sample_every = 2000 # every how many steps to sample from the model
 save_every = -1 # every how many steps to save model checkpoints (-1 = disable, and save only at the end of the run)
 # Output
-model_tag = f"d{depth}" # optionally override the model tag for the output checkpoint directory name
+model_tag = f"d{depth}_moe" # optionally override the model tag for the output checkpoint directory name
 # now allow CLI to override the settings via the configurator lol
 config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
 exec(open(os.path.join('nanochat', 'configurator.py')).read()) # overrides from command line or config file
@@ -112,10 +115,11 @@ print0(f"Total batch size {total_batch_size:,} => gradient accumulation steps: {
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+model_config_kwargs = dict(sequence_len=max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim,
+                           n_expert=num_experts, max_expert_per_tok=max_experts_per_token, alpha=alpha)
 with torch.device("meta"):
-    model_config = GPTConfig(**model_config_kwargs)
-    model = GPT(model_config)
+    model_config = GPTMoEConfig(**model_config_kwargs)
+    model = GPTMoE(model_config)
 model.to_empty(device=device)
 model.init_weights()
 

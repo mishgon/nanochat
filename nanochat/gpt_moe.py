@@ -11,6 +11,7 @@ Notable features:
 - Group-Query Attention (GQA) support for more efficient inference
 """
 
+from typing import Union, Optional
 import math
 from functools import partial
 from dataclasses import dataclass
@@ -23,14 +24,18 @@ from nanochat.common import get_dist_info, print0
 from nanochat.muon import Muon, DistMuon
 from nanochat.adamw import DistAdamW
 
+
 @dataclass
-class GPTConfig:
+class GPTMoEConfig:
     sequence_len: int = 1024
     vocab_size: int = 50304
     n_layer: int = 12
     n_head: int = 6 # number of query heads
     n_kv_head: int = 6 # number of key/value heads (GQA)
     n_embd: int = 768
+    n_expert: int = 8
+    max_expert_per_tok: int = 2
+    alpha: float = 0.01
 
 
 def norm(x):
@@ -122,19 +127,54 @@ class MLP(nn.Module):
         return x
 
 
+class MoE(nn.Module):
+    def __init__(self, config):
+        super().__init__()
+        self.n_expert = config.n_expert
+        self.topk = config.max_expert_per_tok
+        self.gate = nn.Linear(config.n_embd, config.n_expert, bias=False)
+        self.experts = nn.ModuleList([MLP(config) for _ in range(config.n_expert)])
+
+    def forward(self, x):
+        B, T, C = x.size()
+        x = x.view(-1, C)
+        router_logits = self.gate(x)
+
+        expert_weights = F.softmax(router_logits.float(), dim=-1)
+        # select top-k weights
+        selected_weights, selected_experts = expert_weights.topk(self.topk, dim=-1)
+        selected_weights /= selected_weights.sum(dim=-1, keepdim=True)
+        selected_weights = selected_weights.to(router_logits.dtype)
+        expert_mask = F.one_hot(selected_experts, self.n_expert).permute(2, 1, 0)
+
+        x_new = torch.zeros_like(x)
+        for expert_idx in range(self.n_expert):
+            if not expert_mask[expert_idx].any():
+                continue
+
+            expert_rank, tok_idx = torch.where(expert_mask[expert_idx])
+            x_expert = self.experts[expert_idx](x[tok_idx]) * selected_weights[tok_idx, expert_rank].unsqueeze(1)
+            x_new.index_add_(0, tok_idx, x_expert.to(x_new.dtype))
+
+        x_new = x_new.view(B, T, C)
+        # router_logits = router_logits.view(B, T, self.n_expert)
+        return x_new, router_logits
+
+
 class Block(nn.Module):
     def __init__(self, config, layer_idx):
         super().__init__()
         self.attn = CausalSelfAttention(config, layer_idx)
-        self.mlp = MLP(config)
+        self.moe = MoE(config)
 
     def forward(self, x, cos_sin, kv_cache):
         x = x + self.attn(norm(x), cos_sin, kv_cache)
-        x = x + self.mlp(norm(x))
-        return x
+        x_new, router_logits = self.moe(norm(x))
+        x = x + x_new
+        return x, router_logits
 
 
-class GPT(nn.Module):
+class GPTMoE(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.config = config
@@ -159,7 +199,9 @@ class GPT(nn.Module):
         torch.nn.init.zeros_(self.lm_head.weight)
         # zero out c_proj weights in all blocks
         for block in self.transformer.h:
-            torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.zeros_(block.moe.gate.weight)
+            for mlp in block.moe.experts:
+                torch.nn.init.zeros_(mlp.c_proj.weight)
             torch.nn.init.zeros_(block.attn.c_proj.weight)
         # init the rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
@@ -254,8 +296,10 @@ class GPT(nn.Module):
         # Forward the trunk of the Transformer
         x = self.transformer.wte(idx)
         x = norm(x)
+        router_logits_list = []
         for block in self.transformer.h:
-            x = block(x, cos_sin, kv_cache)
+            x, router_logits = block(x, cos_sin, kv_cache)
+            router_logits_list.append(router_logits)
         x = norm(x)
 
         # Forward the lm_head (compute logits)
@@ -267,9 +311,12 @@ class GPT(nn.Module):
         if targets is not None:
             # training: given the targets, compute and return the loss
             # TODO experiment with chunked cross-entropy?
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            main_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            load_balancing_loss = load_balancing_loss_func(tuple(router_logits_list), self.config.n_expert, self.config.max_expert_per_tok)
+            loss = main_loss + self.config.alpha * load_balancing_loss
             scalars = {
-                'main_loss': loss.detach().mean().item()
+                'main_loss': main_loss.detach().mean().item(),
+                'load_balancing_loss': load_balancing_loss.detach().mean().item(),
             }
             return loss, scalars
         else:
@@ -306,3 +353,86 @@ class GPT(nn.Module):
             ids = torch.cat((ids, next_ids), dim=1)
             token = next_ids.item()
             yield token
+
+
+# Copied from transformers.models.mixtral.modeling_mixtral.load_balancing_loss_func
+def load_balancing_loss_func(
+    gate_logits: Union[torch.Tensor, tuple[torch.Tensor], None],
+    num_experts: Optional[int] = None,
+    top_k=2,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, int]:
+    r"""
+    Computes auxiliary load balancing loss as in Switch Transformer - implemented in Pytorch.
+
+    See Switch Transformer (https://huggingface.co/papers/2101.03961) for more details. This function implements the loss
+    function presented in equations (4) - (6) of the paper. It aims at penalizing cases where the routing between
+    experts is too unbalanced.
+
+    Args:
+        gate_logits:
+            Logits from the `gate`, should be a tuple of model.config.num_hidden_layers tensors of
+            shape [batch_size X sequence_length, num_experts].
+        num_experts:
+            Number of experts
+        top_k:
+            The number of experts to route per-token, can be also interpreted as the `top-k` routing
+            parameter.
+        attention_mask (`torch.Tensor`, *optional*):
+            The attention_mask used in forward function
+            shape [batch_size X sequence_length] if not None.
+
+    Returns:
+        The auxiliary loss.
+    """
+    if gate_logits is None or not isinstance(gate_logits, tuple):
+        return 0
+
+    if isinstance(gate_logits, tuple):
+        compute_device = gate_logits[0].device
+        concatenated_gate_logits = torch.cat([layer_gate.to(compute_device) for layer_gate in gate_logits], dim=0)
+
+    routing_weights = torch.nn.functional.softmax(concatenated_gate_logits, dim=-1)
+
+    _, selected_experts = torch.topk(routing_weights, top_k, dim=-1)
+
+    expert_mask = torch.nn.functional.one_hot(selected_experts, num_experts)
+
+    if attention_mask is None:
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.mean(expert_mask.float(), dim=0)
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.mean(routing_weights, dim=0)
+    else:
+        batch_size, sequence_length = attention_mask.shape
+        num_hidden_layers = concatenated_gate_logits.shape[0] // (batch_size * sequence_length)
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of expert_mask
+        expert_attention_mask = (
+            attention_mask[None, :, :, None, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, top_k, num_experts))
+            .reshape(-1, top_k, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the percentage of tokens routed to each experts
+        tokens_per_expert = torch.sum(expert_mask.float() * expert_attention_mask, dim=0) / torch.sum(
+            expert_attention_mask, dim=0
+        )
+
+        # Compute the mask that masks all padding tokens as 0 with the same shape of tokens_per_expert
+        router_per_expert_attention_mask = (
+            attention_mask[None, :, :, None]
+            .expand((num_hidden_layers, batch_size, sequence_length, num_experts))
+            .reshape(-1, num_experts)
+            .to(compute_device)
+        )
+
+        # Compute the average probability of routing to these experts
+        router_prob_per_expert = torch.sum(routing_weights * router_per_expert_attention_mask, dim=0) / torch.sum(
+            router_per_expert_attention_mask, dim=0
+        )
+
+    overall_loss = torch.sum(tokens_per_expert * router_prob_per_expert.unsqueeze(0))
+    return overall_loss * num_experts
