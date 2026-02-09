@@ -15,7 +15,9 @@ import os
 os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
 import ast
+import math
 import time
+import itertools
 from contextlib import nullcontext
 from collections import defaultdict
 
@@ -42,8 +44,8 @@ parser = argparse.ArgumentParser(description="Pretrain base model")
 # Runtime
 parser.add_argument("--device-type", type=str, default="", help="cuda|cpu|mps (empty = autodetect)")
 # Model architecture
-parser.add_argument("--depth", type=ast.literal_eval, default="((5, 5), (10, 10))", help="depth of the Transformer model (one or more integers, e.g., '--depth=\"((6, 6),)\"')")
-parser.add_argument("--model-dim", type=ast.literal_eval, default="(1280, 2560)", help="hidden size of the model (one or more integers, e.g., '--model-dim=\"(768,)\"')")
+parser.add_argument("--depth", type=ast.literal_eval, default="((18, 2),)", help="depth of the Transformer model (one or more integers, e.g., '--depth=\"((18, 2),)\"')")
+parser.add_argument("--model-dim", type=ast.literal_eval, default="(1280,)", help="hidden size of the model (one or more integers, e.g., '--model-dim=\"(1280,)\"')")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 # Training horizon (only one used, in order of precedence)
@@ -256,6 +258,19 @@ def get_muon_momentum(it):
 def get_weight_decay(it):
     return weight_decay_scaled * (1 - it / num_iterations)
 
+
+def get_ema_momentum(it):
+    warmup_iters = 0  # num_iterations // 10
+    start_warmup_value = 1.0
+    base_value = 0.999
+    final_value = 1.0
+    if it < warmup_iters:
+        return start_warmup_value * (1 - (it + 1) / (warmup_iters + 1)) + base_value * (it + 1) / (warmup_iters + 1)
+    else:
+        return final_value + 0.5 * (base_value - final_value) * (
+            1.0 + math.cos(math.pi * (it - warmup_iters) / (num_iterations - warmup_iters))
+        )
+
 # tensorboard
 tb_logger = SummaryWriter(log_dir=os.path.join(base_dir, "tb_logs", "base", model_tag))
 
@@ -285,23 +300,23 @@ while True:
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
     # once in a while: evaluate the val bpb (all ranks participate)
-    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
-        model.eval()
-        val_loader = build_val_loader()
-        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
-        if val_bpb < min_val_bpb:
-            min_val_bpb = val_bpb
-        # wandb_run.log({
-        #     "step": step,
-        #     "total_training_flops": flops_so_far,
-        #     "total_training_time": total_training_time,
-        #     "val/bpb": val_bpb,
-        # })
-        tb_logger.add_scalar("val/bpb", val_bpb, step)
-        model.train()
+    # if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+    #     model.eval()
+    #     val_loader = build_val_loader()
+    #     eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+    #     with autocast_ctx:
+    #         val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+    #     print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
+    #     if val_bpb < min_val_bpb:
+    #         min_val_bpb = val_bpb
+    #     # wandb_run.log({
+    #     #     "step": step,
+    #     #     "total_training_flops": flops_so_far,
+    #     #     "total_training_time": total_training_time,
+    #     #     "val/bpb": val_bpb,
+    #     # })
+    #     tb_logger.add_scalar("val/bpb", val_bpb, step)
+    #     model.train()
 
     # once in a while: estimate the CORE metric (all ranks participate)
     # use the original uncompiled model because the inputs keep changing shape
@@ -398,6 +413,13 @@ while True:
         group["weight_decay"] = muon_weight_decay
     for opt in optimizers:
         opt.step()
+    # ema update
+    ema_params = itertools.chain(model.ema_wte.parameters(), model.ema_encoder.parameters())
+    src_params = itertools.chain(model.wte.parameters(), model.encoder.parameters())
+    ema_momentum = get_ema_momentum(step)
+    for ema_param, src_param in zip(ema_params, src_params):
+        ema_param.data.mul_(ema_momentum)
+        ema_param.data.add_((1 - ema_momentum) * src_param.data)
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -406,12 +428,12 @@ while True:
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
-    ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    smoothing = 0.9 # just for nicer logging
+    smooth_train_loss = smoothing * smooth_train_loss + (1 - smoothing) * train_loss_f # EMA the training loss
+    debiased_smooth_loss = smooth_train_loss / (1 - smoothing**(step + 1)) # debias the EMA
     for k, v in scalars.items():
-        smooth_train_scalars[k] = ema_beta * smooth_train_scalars[k] + (1 - ema_beta) * v.item()
-    debiased_smooth_scalars = {k: v / (1 - ema_beta**(step + 1)) for k, v in smooth_train_scalars.items()}
+        smooth_train_scalars[k] = smoothing * smooth_train_scalars[k] + (1 - smoothing) * v.item()
+    debiased_smooth_scalars = {k: v / (1 - smoothing**(step + 1)) for k, v in smooth_train_scalars.items()}
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt
@@ -441,6 +463,7 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "ema_momentum": ema_momentum
         }
         # wandb_run.log(log_data)
         for k, v in log_data.items():
