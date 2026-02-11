@@ -12,6 +12,7 @@ Everything works with token sequences (no tokenization logic here).
 
 import torch
 import torch.nn.functional as F
+import time
 from collections import deque
 from typing import List, Tuple, Optional
 
@@ -302,6 +303,7 @@ class UNetEngine:
         self.model = model
         self.tokenizer = tokenizer
     
+    @torch.inference_mode()
     def _prefill_forward(self, ids, kv_cache):
         """
         Prefill forward pass: runs all stages and caches encoder outputs.
@@ -399,6 +401,7 @@ class UNetEngine:
         
         return logits
     
+    @torch.inference_mode()
     def _efficient_decode_forward(self, ids, kv_cache):
         """
         Efficient decode forward: only runs stages that need to process new tokens.
@@ -570,6 +573,7 @@ class UNetEngine:
         # Return only the last token's logits
         return logits[:, -1:, :]
     
+    @torch.inference_mode()
     def _safe_forward(self, ids, kv_cache, use_efficient_decode=True):
         """
         Smart forward that chooses between prefill and efficient decode.
@@ -598,7 +602,7 @@ class UNetEngine:
             return self._prefill_forward(ids, kv_cache)
 
     @torch.inference_mode()
-    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42):
+    def generate(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42, ignore_assistant_end=False):
         """
         Efficient batched generation with KV caching.
         
@@ -662,8 +666,10 @@ class UNetEngine:
         num_generated = 0
         while True:
             if max_tokens is not None and num_generated >= max_tokens:
+                print(max_tokens, num_generated, 'num generated reached')
                 break
             if all(state.completed for state in row_states):
+                print(row_states, 'state completed')
                 break
 
             # Sample next tokens
@@ -681,7 +687,7 @@ class UNetEngine:
                 state.current_tokens.append(next_token)
                 
                 # Handle completion
-                if (assistant_end and next_token == assistant_end) or (bos and next_token == bos):
+                if (not ignore_assistant_end) and ((assistant_end and next_token == assistant_end) or (bos and next_token == bos)):
                     state.completed = True
 
             # Yield the token column
@@ -721,6 +727,121 @@ class UNetEngine:
                 break
         
         return results, masks
+
+    @torch.inference_mode()
+    def generate_w_timing(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42, ignore_assistant_end=False):
+        """
+        Generate with detailed timing measurements for prefill and each decode token.
+        
+        Yields:
+            (token_column, token_masks, timing_info) where timing_info is a dict:
+            - 'prefill_time': time for prefill phase (only on first yield)
+            - 'decode_times': list of times for each decode token (cumulative)
+            - 'token_times': list of individual token decode times
+        """
+        assert isinstance(tokens, list) and all(isinstance(t, int) for t in tokens), "expecting list of ints"
+        device = self.model.get_device()
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+
+        synchronize = torch.cuda.synchronize if device.type == "cuda" else lambda: None
+
+        # Get special tokens (if tokenizer supports them)
+        bos = self.tokenizer.get_bos_token_id() if hasattr(self.tokenizer, 'get_bos_token_id') else None
+        assistant_end = None
+        if hasattr(self.tokenizer, 'encode_special'):
+            try:
+                assistant_end = self.tokenizer.encode_special("<|assistant_end|>")
+            except:
+                pass
+
+        # Timing info
+        timing_info = {
+            'prefill_time': None,
+            'decode_times': [],
+            'token_times': []
+        }
+
+        # 1) Prefill with batch size 1
+        synchronize()
+        prefill_start = time.time()
+        
+        config = self.model.config
+        kv_cache_prefill = UNetKVCache(
+            batch_size=1,
+            config=config,
+            max_seq_len=len(tokens) + (max_tokens or config.sequence_len),
+            device=device,
+            dtype=dtype,
+        )
+        
+        # Run prefill forward pass
+        ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        logits = self._safe_forward(ids, kv_cache_prefill)
+        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+        
+        synchronize()
+        prefill_end = time.time()
+        timing_info['prefill_time'] = prefill_end - prefill_start
+
+        # 2) Clone cache for multi-sample generation
+        kv_length_hint = len(tokens) + (max_tokens if max_tokens else config.sequence_len)
+        kv_cache_decode = UNetKVCache(
+            batch_size=num_samples,
+            config=config,
+            max_seq_len=kv_length_hint,
+            device=device,
+            dtype=dtype,
+        )
+        kv_cache_decode.prefill(kv_cache_prefill)
+        del kv_cache_prefill
+
+        # 3) Initialize row states
+        row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
+
+        # 4) Generation loop
+        num_generated = 0
+        while True:
+            if max_tokens is not None and num_generated >= max_tokens:
+                break
+            if all(state.completed for state in row_states):
+                break
+
+            # Sample next tokens
+            next_ids = sample_next_token(logits, rng, temperature, top_k)
+            sampled_tokens = next_ids[:, 0].tolist()
+
+            # Process each row
+            token_column = []
+            token_masks = []
+            for i, state in enumerate(row_states):
+                is_forced = len(state.forced_tokens) > 0
+                token_masks.append(0 if is_forced else 1)
+                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                token_column.append(next_token)
+                state.current_tokens.append(next_token)
+                
+                # Handle completion
+                if (not ignore_assistant_end) and ((assistant_end and next_token == assistant_end) or (bos and next_token == bos)):
+                    state.completed = True
+
+            # Yield the token column with timing info
+            yield token_column, token_masks, timing_info.copy()
+            num_generated += 1
+
+            # Prepare logits for next iteration with timing
+            synchronize()
+            decode_start = time.time()
+            
+            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+            logits = self._safe_forward(ids, kv_cache_decode)[:, -1, :]
+            
+            synchronize()
+            decode_end = time.time()
+            token_time = decode_end - decode_start
+            timing_info['token_times'].append(token_time)
+            timing_info['decode_times'].append(sum(timing_info['token_times']))
 
 
 # -----------------------------------------------------------------------------
