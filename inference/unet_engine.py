@@ -60,11 +60,12 @@ class UNetKVCache:
         self.layer_to_stage = []
         self.layer_is_decoder = []
         for stage_idx in range(self.n_stages):
-            n_layers_half = config.n_layer[stage_idx] // 2
-            for _ in range(n_layers_half):  # Encoder layers for this stage
+            # n_layer[stage_idx] is now a tuple (encoder_n_layer, decoder_n_layer)
+            encoder_n_layer, decoder_n_layer = config.n_layer[stage_idx]
+            for _ in range(encoder_n_layer):  # Encoder layers for this stage
                 self.layer_to_stage.append(stage_idx)
                 self.layer_is_decoder.append(False)
-            for _ in range(n_layers_half):  # Decoder layers for this stage
+            for _ in range(decoder_n_layer):  # Decoder layers for this stage
                 self.layer_to_stage.append(stage_idx)
                 self.layer_is_decoder.append(True)
         
@@ -827,7 +828,7 @@ class UNetEngine:
                     state.completed = True
 
             # Yield the token column with timing info
-            yield token_column, token_masks, timing_info.copy()
+            yield token_column, token_masks, timing_info["token_times"][-1] if len(timing_info["token_times"]) > 0 else 0.0
             num_generated += 1
 
             # Prepare logits for next iteration with timing
