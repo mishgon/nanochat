@@ -15,6 +15,7 @@ import torch
 import torch.nn.functional as F
 import signal
 import warnings
+import time
 from contextlib import contextmanager
 from collections import deque
 from nanochat.common import compute_init, autodetect_device_type
@@ -297,6 +298,140 @@ class Engine:
             if all(completed):
                 break
         return results, masks
+
+    @torch.inference_mode()
+    def generate_w_timing(self, tokens, num_samples=1, max_tokens=None, temperature=1.0, top_k=None, seed=42, ignore_assistant_end=False):
+        """
+        Generate with detailed timing measurements for prefill and each decode token.
+        
+        Yields:
+            (token_column, token_masks, timing_info) where timing_info is a dict:
+            - 'prefill_time': time for prefill phase (only on first yield)
+            - 'decode_times': list of times for each decode token (cumulative)
+            - 'token_times': list of individual token decode times
+        """
+        assert isinstance(tokens, list) and isinstance(tokens[0], int), "expecting list of ints"
+        device = self.model.get_device()
+        dtype = torch.bfloat16 if device.type == "cuda" else torch.float32
+        rng = torch.Generator(device=device)
+        rng.manual_seed(seed)
+
+        synchronize = torch.cuda.synchronize if device.type == "cuda" else lambda: None
+
+        # Get the special tokens we need to coordinate the tool use state machine
+        get_special = lambda s: self.tokenizer.encode_special(s)
+        python_start = get_special("<|python_start|>")
+        python_end = get_special("<|python_end|>")
+        output_start = get_special("<|output_start|>")
+        output_end = get_special("<|output_end|>")
+        assistant_end = get_special("<|assistant_end|>") # if sampled, ends row
+        bos = self.tokenizer.get_bos_token_id() # if sampled, ends row
+
+        # Timing info
+        timing_info = {
+            'prefill_time': None,
+            'decode_times': [],
+            'token_times': []
+        }
+
+        # 1) Run a batch 1 prefill of the prompt tokens
+        synchronize()
+        prefill_start = time.time()
+        
+        m = self.model.config
+        kv_model_kwargs = {"num_heads": m.n_kv_head, "head_dim": m.n_embd // m.n_head, "num_layers": m.n_layer}
+        kv_cache_prefill = KVCache(
+            batch_size=1,
+            seq_len=len(tokens),
+            device=device,
+            dtype=dtype,
+            **kv_model_kwargs,
+        )
+        ids = torch.tensor([tokens], dtype=torch.long, device=device)
+        logits = self.model.forward(ids, kv_cache=kv_cache_prefill)
+        logits = logits[:, -1, :].expand(num_samples, -1)  # (num_samples, vocab_size)
+        
+        synchronize()
+        prefill_end = time.time()
+        timing_info['prefill_time'] = prefill_end - prefill_start
+
+        # 2) Replicate the KV cache for each sample/row
+        kv_length_hint = (len(tokens) + max_tokens) if max_tokens is not None else self.model.config.sequence_len
+        kv_cache_decode = KVCache(
+            batch_size=num_samples,
+            seq_len=kv_length_hint,
+            device=device,
+            dtype=dtype,
+            **kv_model_kwargs,
+        )
+        kv_cache_decode.prefill(kv_cache_prefill)
+        del kv_cache_prefill # no need to keep this memory around
+
+        # 3) Initialize states for each sample
+        row_states = [RowState(tokens.copy()) for _ in range(num_samples)]
+
+        # 4) Main generation loop
+        num_generated = 0
+        while True:
+            # Stop condition: we've reached max tokens
+            if max_tokens is not None and num_generated >= max_tokens:
+                break
+            # Stop condition: all rows are completed
+            if all(state.completed for state in row_states):
+                break
+
+            # Sample the next token for each row
+            next_ids = sample_next_token(logits, rng, temperature, top_k)  # (B, 1)
+            sampled_tokens = next_ids[:, 0].tolist()
+
+            # Process each row: choose the next token, update state, optional tool use
+            token_column = [] # contains the next token id along each row
+            token_masks = [] # contains the mask (was it sampled (1) or forced (0)?) along each row
+            for i, state in enumerate(row_states):
+                # Select the next token in this row
+                is_forced = len(state.forced_tokens) > 0 # are there tokens waiting to be forced in deque?
+                token_masks.append(0 if is_forced else 1) # mask is 0 if forced, 1 if sampled
+                next_token = state.forced_tokens.popleft() if is_forced else sampled_tokens[i]
+                token_column.append(next_token)
+                # Update the state of this row to include the next token
+                state.current_tokens.append(next_token)
+                # On <|assistant_end|> or <|bos|>, mark the row as completed
+                if not ignore_assistant_end and (next_token == assistant_end or next_token == bos):
+                    state.completed = True
+                # Handle tool logic
+                if next_token == python_start:
+                    state.in_python_block = True
+                    state.python_expr_tokens = []
+                elif next_token == python_end and state.in_python_block:
+                    state.in_python_block = False
+                    if state.python_expr_tokens:
+                        expr = self.tokenizer.decode(state.python_expr_tokens)
+                        result = use_calculator(expr)
+                        if result is not None:
+                            result_tokens = self.tokenizer.encode(str(result))
+                            state.forced_tokens.append(output_start)
+                            state.forced_tokens.extend(result_tokens)
+                            state.forced_tokens.append(output_end)
+                    state.python_expr_tokens = []
+                elif state.in_python_block:
+                    state.python_expr_tokens.append(next_token)
+
+            # Yield the token column with timing info
+            yield token_column, token_masks, timing_info.copy()
+            num_generated += 1
+
+            # Prepare logits for next iteration with timing
+            synchronize()
+            decode_start = time.time()
+            
+            ids = torch.tensor(token_column, dtype=torch.long, device=device).unsqueeze(1)
+            logits = self.model.forward(ids, kv_cache=kv_cache_decode)[:, -1, :]  # (B, vocab_size)
+            
+            synchronize()
+            decode_end = time.time()
+            token_time = decode_end - decode_start
+            timing_info['token_times'].append(token_time)
+            timing_info['decode_times'].append(sum(timing_info['token_times']))
 
 
 if __name__ == "__main__":
