@@ -16,6 +16,7 @@ os.environ["PYTORCH_ALLOC_CONF"] = "expandable_segments:True"
 import argparse
 import time
 from contextlib import nullcontext
+from collections import defaultdict
 
 # import wandb
 import torch
@@ -267,6 +268,7 @@ if not resuming:
     val_bpb = None # will be set if eval_every > 0
     min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
+    smooth_train_scalars = defaultdict(lambda: 0)
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
@@ -274,6 +276,7 @@ else:
     val_bpb = meta_data["val_bpb"]
     min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
+    smooth_train_scalars = loop_state["smooth_train_scalars"]
     total_training_time = loop_state["total_training_time"]
 
 # -----------------------------------------------------------------------------
@@ -359,6 +362,7 @@ while True:
                 "loop_state": { # all loop state (other than step) so that we can resume training
                     "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
+                    "smooth_train_scalars": smooth_train_scalars,
                     "total_training_time": total_training_time,
                 },
             },
@@ -376,7 +380,7 @@ while True:
     t0 = time.time()
     for micro_step in range(grad_accum_steps):
         with autocast_ctx:
-            loss = model(x, y)
+            loss, scalars = model(x, y)
         train_loss = loss.detach() # for logging
         loss = loss / grad_accum_steps # each .backward() is a grad sum => normalize loss here
         loss.backward()
@@ -401,9 +405,12 @@ while True:
     # -------------------------------------------------------------------------
 
     # logging (CPU action only)
-    ema_beta = 0.9 # EMA decay factor for some smoothing just for nicer logging
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f # EMA the training loss
-    debiased_smooth_loss = smooth_train_loss / (1 - ema_beta**(step + 1)) # debias the EMA
+    smoothing = 0.9 # EMA decay factor for some smoothing just for nicer logging
+    smooth_train_loss = smoothing * smooth_train_loss + (1 - smoothing) * train_loss_f # EMA the training loss
+    debiased_smooth_loss = smooth_train_loss / (1 - smoothing**(step + 1)) # debias the EMA
+    for k, v in scalars.items():
+        smooth_train_scalars[k] = smoothing * smooth_train_scalars[k] + (1 - smoothing) * v
+    debiased_smooth_scalars = {k: v / (1 - smoothing**(step + 1)) for k, v in smooth_train_scalars.items()}
     pct_done = 100 * step / num_iterations
     tok_per_sec = int(args.total_batch_size / dt)
     flops_per_sec = num_flops_per_token * args.total_batch_size / dt
@@ -427,6 +434,7 @@ while True:
             "total_training_flops": flops_so_far,
             "total_training_time": total_training_time,
             "train/loss": debiased_smooth_loss,
+            **{f"train/{k}": v for k, v in debiased_smooth_scalars.items()},
             "train/lrm": lrm,
             "train/dt": dt,
             "train/tok_per_sec": tok_per_sec,

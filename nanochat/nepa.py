@@ -2,6 +2,8 @@ from functools import partial
 from dataclasses import dataclass
 from typing import Sequence, Tuple
 import itertools
+from copy import deepcopy
+import math
 
 import torch
 import torch.nn as nn
@@ -19,10 +21,11 @@ from nanochat.flash_attention import flash_attn
 class UNetConfig:
     sequence_len: int = 2048
     vocab_size: int = 32768
-    n_layer: Sequence[Tuple[int, int]] = ((5, 5), (10, 10))
-    n_head: Sequence[int] = (10, 20) # number of query heads
-    n_kv_head: Sequence[int] = (10, 20) # number of key/value heads (GQA)
-    n_embd: Sequence[int] = (1280, 2560)
+    n_layer: Sequence[Tuple[int, int]] = ((18, 2),)
+    n_head: Sequence[int] = (10,) # number of query heads
+    n_kv_head: Sequence[int] = (10,) # number of key/value heads (GQA)
+    n_embd: Sequence[int] = (1280,)
+    nepa_n_cluster: int = 32768
 
 
 def count_params(module):
@@ -147,6 +150,13 @@ class Unpool(nn.Module):
         return x
 
 
+def reduced_sum(*args, **kwargs):
+    summed = torch.sum(*args, **kwargs)
+    if torch.distributed.is_initialized():
+        torch.distributed.all_reduce(summed)
+    return summed
+
+
 class UNet(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
@@ -162,23 +172,42 @@ class UNet(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
+        # Embedding
         self.wte = nn.Embedding(padded_vocab_size, config.n_embd[0])
+        # Encoder, NEPA, decoder
         self.encoder = nn.ModuleDict({})
         self.decoder = nn.ModuleDict({})
+        self.nepa = nn.ModuleDict({})
         for stage_idx in range(self.n_stage):
             encoder_n_layer, decoder_n_layer = config.n_layer[stage_idx]
+            nepa_n_layer = encoder_n_layer // 2
+            # Encoder
             if stage_idx > 0:
                 self.encoder[f"pool_{stage_idx - 1}->{stage_idx}"] = Pool(config.n_embd[stage_idx - 1], config.n_embd[stage_idx])
             self.encoder[f"transformer_{stage_idx}"] = nn.ModuleList([
                 Block(config.n_head[stage_idx], config.n_kv_head[stage_idx], config.n_embd[stage_idx], layer_idx)
                 for layer_idx in range(encoder_n_layer)
             ])
+            # NEPA
+            self.nepa[f"transformer_{stage_idx}"] = nn.ModuleList([
+                Block(config.n_head[stage_idx], config.n_kv_head[stage_idx], config.n_embd[stage_idx], layer_idx)
+                for layer_idx in range(nepa_n_layer)
+            ])
+            self.nepa[f"pred_head_{stage_idx}"] = nn.Linear(config.n_embd[stage_idx], config.nepa_n_cluster, bias=False)
+            self.nepa[f"cluster_head_{stage_idx}"] = nn.Linear(config.n_embd[stage_idx], config.nepa_n_cluster, bias=True)
+            if stage_idx > 0:
+                self.nepa[f"unpool_{stage_idx}->{stage_idx - 1}"] = Unpool(config.n_embd[stage_idx], config.n_embd[stage_idx - 1])
+            # Decoder
             self.decoder[f"transformer_{stage_idx}"] = nn.ModuleList([
                 Block(config.n_head[stage_idx], config.n_kv_head[stage_idx], config.n_embd[stage_idx], layer_idx)
                 for layer_idx in range(decoder_n_layer)
             ])
             if stage_idx > 0:
                 self.decoder[f"unpool_{stage_idx}->{stage_idx - 1}"] = Unpool(config.n_embd[stage_idx], config.n_embd[stage_idx - 1])
+        # EMA embedding and encoder and NEPA unembedding
+        self.ema_wte = deepcopy(self.wte)
+        self.ema_encoder = deepcopy(self.encoder)
+        # Unembedding
         self.lm_head = nn.Linear(config.n_embd[0], padded_vocab_size, bias=False)
 
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
@@ -213,12 +242,13 @@ class UNet(nn.Module):
         torch.nn.init.normal_(self.wte.weight, mean=0.0, std=1.0)
         torch.nn.init.normal_(self.lm_head.weight, mean=0.0, std=0.001)
 
-        # Encoder, decoder
+        # Encoder, NEPA, decoder
         for stage_idx in range(self.n_stage):
             s = 3**0.5 * self.config.n_embd[stage_idx]**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
             if stage_idx > 0:
                 torch.nn.init.normal_(self.encoder[f"pool_{stage_idx - 1}->{stage_idx}"].c_proj.weight, mean=0.0, std=0.001)
             for block in itertools.chain(self.encoder[f"transformer_{stage_idx}"],
+                                         self.nepa[f"transformer_{stage_idx}"],
                                          self.decoder[f"transformer_{stage_idx}"]):
                 torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
                 torch.nn.init.uniform_(block.attn.c_k.weight, -s, s)
@@ -226,8 +256,18 @@ class UNet(nn.Module):
                 torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.normal_(self.nepa[f"pred_head_{stage_idx}"].weight, mean=0.0, std=0.001)
+            torch.nn.init.normal_(self.nepa[f"cluster_head_{stage_idx}"].weight, mean=0.0, std=0.001)
+            torch.nn.init.zeros_(self.nepa[f"cluster_head_{stage_idx}"].bias)
             if stage_idx > 0:
+                torch.nn.init.normal_(self.nepa[f"unpool_{stage_idx}->{stage_idx - 1}"].c_proj.weight, mean=0.0, std=0.001)
                 torch.nn.init.normal_(self.decoder[f"unpool_{stage_idx}->{stage_idx - 1}"].c_proj.weight, mean=0.0, std=0.001)
+
+        # EMA embedding and encoder and NEPA unembedding
+        ema_params = itertools.chain(self.ema_wte.parameters(), self.ema_encoder.parameters())
+        src_params = itertools.chain(self.wte.parameters(), self.encoder.parameters())
+        for ema_param, src_param in zip(ema_params, src_params):
+            ema_param.data.copy_(src_param.data)
 
         # Rotary embeddings
         head_dim = self.config.n_embd[0] // self.config.n_head[0]
@@ -285,7 +325,7 @@ class UNet(nn.Module):
         Ref: https://arxiv.org/abs/2203.15556 (Chinchilla paper <- good).
         Ref: https://arxiv.org/abs/2001.08361 (Kaplan et al. original scaling laws paper <- bad)
         """
-        return count_params(self)
+        return count_params(self.wte) + count_params(self.encoder) + count_params(self.decoder) + count_params(self.lm_head)
 
     def setup_optimizers(self, embedding_lr=0.2, pool_lr=0.004, unpool_lr=0.004, unembedding_lr=0.004, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95)):
         model_dim = self.config.n_embd[0]
@@ -295,16 +335,22 @@ class UNet(nn.Module):
         pool_params = []
         matrix_params = []
         unpool_params = []
+        unembedding_params = []
         for stage in range(self.n_stage):
             if stage > 0:
                 pool_params.extend(list(self.encoder[f"pool_{stage - 1}->{stage}"].parameters()))
             matrix_params.extend(list(self.encoder[f"transformer_{stage}"].parameters()))
+            matrix_params.extend(list(self.nepa[f"transformer_{stage}"].parameters()))
+            unembedding_params.extend(list(self.nepa[f"pred_head_{stage}"].parameters()))
+            unembedding_params.extend(list(self.nepa[f"cluster_head_{stage}"].parameters()))
             matrix_params.extend(list(self.decoder[f"transformer_{stage}"].parameters()))
             if stage > 0:
+                unpool_params.extend(list(self.nepa[f"unpool_{stage}->{stage - 1}"].parameters()))
                 unpool_params.extend(list(self.decoder[f"unpool_{stage}->{stage - 1}"].parameters()))
-        lm_head_params = list(self.lm_head.parameters())
+        unembedding_params.extend(list(self.lm_head.parameters()))
+        ema_params = list(self.ema_wte.parameters()) + list(self.ema_encoder.parameters())
         assert len(list(self.parameters())) == \
-            len(embedding_params) + len(pool_params) + len(matrix_params) + len(unpool_params) + len(lm_head_params)
+            len(embedding_params) + len(pool_params) + len(matrix_params) + len(unpool_params) + len(unembedding_params) + len(ema_params)
         # Create the AdamW optimizer for the embedding, pool, unpool, and lm_head layers
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -313,7 +359,7 @@ class UNet(nn.Module):
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
             dict(params=pool_params, lr=pool_lr * dmodel_lr_scale),
             dict(params=unpool_params, lr=unpool_lr * dmodel_lr_scale),
-            dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
+            dict(params=unembedding_params, lr=unembedding_lr * dmodel_lr_scale),
         ]
         adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0) # NOTE: weight decay is hardcoded to 0.0 for AdamW, only used in Muon
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
@@ -329,7 +375,7 @@ class UNet(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None, loss_reduction='mean'):
+    def forward(self, idx, targets=None, kv_cache=None):
         B, T = idx.size()
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
@@ -346,11 +392,9 @@ class UNet(nn.Module):
                 sin[:, (2 ** stage_idx - 1)::(2 ** stage_idx)]
             )
 
-        # Input embed
+        # Embedding and encoder
         x = self.wte(idx)
         x = norm(x)
-        
-        # Encoder
         encoder_outputs = []
         for stage_idx in range(self.n_stage):
             if stage_idx > 0:
@@ -359,6 +403,7 @@ class UNet(nn.Module):
                 # Pool
                 x = self.encoder[f"pool_{stage_idx - 1}->{stage_idx}"](x)
                 x = norm(x)
+
             # Stage
             pooled_cos_sin = pool_cos_sin(*cos_sin, stage_idx)
             for block in self.encoder[f"transformer_{stage_idx}"]:
@@ -366,7 +411,9 @@ class UNet(nn.Module):
             encoder_outputs.append(x)
 
         # Decoder
-        for stage_idx in reversed(range(len(encoder_outputs))):
+        detached_encoder_outputs = [x.detach() for x in encoder_outputs]
+        x = detached_encoder_outputs[-1]
+        for stage_idx in reversed(range(len(detached_encoder_outputs))):
             # Stage
             pooled_cos_sin = pool_cos_sin(*cos_sin, stage_idx)
             for block in self.decoder[f"transformer_{stage_idx}"]:
@@ -376,12 +423,12 @@ class UNet(nn.Module):
             if stage_idx > 0:
                 # Unpool, shift & skip-connection
                 x = self.decoder[f"unpool_{stage_idx}->{stage_idx - 1}"](x)
-                y = encoder_outputs[stage_idx - 1]
-                if x.size(1) == y.size(1):
+                skip_connection = detached_encoder_outputs[stage_idx - 1]
+                if x.size(1) == skip_connection.size(1):
                     x = x[:, :-1]
-                shifted_x = torch.zeros_like(y)
+                shifted_x = torch.zeros_like(skip_connection)
                 shifted_x[:, 1:] = x
-                x = y + shifted_x
+                x = shifted_x + skip_connection
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
@@ -390,14 +437,91 @@ class UNet(nn.Module):
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
-        if targets is not None:
-            # training: given the targets, compute and return the loss
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
-            scalars = {}
-            return loss, scalars
-        else:
-            # inference: just return the logits directly
+        if targets is None:
             return logits
+
+        probing_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+        scalars = {"probing_loss": probing_loss.detach()}
+
+        # EMA embeddng and encoder
+        with torch.no_grad():
+            x = self.ema_wte(idx)
+            x = norm(x)
+            ema_encoder_outputs = []
+            for stage_idx in range(self.n_stage):
+                if stage_idx > 0:
+                    if x.size(1) == 1:
+                        break
+                    # Pool
+                    x = self.ema_encoder[f"pool_{stage_idx - 1}->{stage_idx}"](x)
+                    x = norm(x)
+
+                # Stage
+                pooled_cos_sin = pool_cos_sin(*cos_sin, stage_idx)
+                for block in self.ema_encoder[f"transformer_{stage_idx}"]:
+                    x = block(x, pooled_cos_sin, kv_cache)
+                ema_encoder_outputs.append(x)
+
+        # NEPA
+        x = encoder_outputs[-1]
+        total_nepa_loss = 0.0
+        for stage_idx in reversed(range(len(encoder_outputs))):
+            # Stage
+            pooled_cos_sin = pool_cos_sin(*cos_sin, stage_idx)
+            for block in self.nepa[f"transformer_{stage_idx}"]:
+                x = block(x, pooled_cos_sin, kv_cache)
+            x = norm(x)
+            if x.size(1) > 1:
+                # Prediction head
+                nepa_pred_logits = self.nepa[f"pred_head_{stage_idx}"](x[:, :-1])
+                nepa_pred_logits = nepa_pred_logits.view(-1, nepa_pred_logits.size(-1))
+                # Clustering head
+                y = ema_encoder_outputs[stage_idx][:, 1:]
+                y = norm(y)
+                nepa_cluster_logits = self.nepa[f"cluster_head_{stage_idx}"](y)
+                nepa_cluster_logits = nepa_cluster_logits.view(-1, nepa_cluster_logits.size(-1))
+                # Targets
+                with torch.no_grad():
+                    nepa_targets = torch.softmax(nepa_cluster_logits.detach() / 0.5, dim=-1)
+                    eps = 1e-8
+                    for _ in range(3):
+                        nepa_targets /= reduced_sum(nepa_targets, dim=-2, keepdim=True) + eps
+                        nepa_targets /= torch.sum(nepa_targets, dim=-1, keepdim=True) + eps
+                # Losses
+                nepa_cluster_loss = F.cross_entropy(nepa_cluster_logits, nepa_targets)  # nepa_cluster_entropy + math.log(self.config.nepa_n_cluster) - nepa_cluster_mean_entropy
+                nepa_pred_loss = F.cross_entropy(nepa_pred_logits, nepa_targets)
+                total_nepa_loss += nepa_pred_loss + nepa_cluster_loss
+                scalars[f"nepa_cluster_loss_at_stage_{stage_idx}"] = nepa_cluster_loss.detach()
+                scalars[f"nepa_pred_loss_at_stage_{stage_idx}"] = nepa_pred_loss.detach()
+
+                with torch.no_grad():
+                    nepa_cluster_probs = torch.softmax(nepa_cluster_logits, dim=-1)
+                    nepa_cluster_log_probs = torch.log_softmax(nepa_cluster_logits, dim=-1)
+                    nepa_cluster_log_mean_probs = torch.logsumexp(nepa_cluster_log_probs, dim=0) - math.log(nepa_cluster_log_probs.size(0))
+                    nepa_cluster_mean_probs = torch.softmax(nepa_cluster_log_mean_probs, dim=-1)
+                    nepa_cluster_entropy = torch.mean(torch.sum(-nepa_cluster_probs * nepa_cluster_log_probs, dim=-1))
+                    nepa_cluster_mean_entropy = torch.mean(torch.sum(-nepa_cluster_mean_probs * nepa_cluster_log_mean_probs, dim=-1))
+                    scalars[f"nepa_cluster_entropy_at_stage_{stage_idx}"] = nepa_cluster_entropy.detach()
+                    scalars[f"nepa_cluster_mean_entropy_at_stage_{stage_idx}"] = nepa_cluster_mean_entropy.detach()
+            else:
+                # Use a scalar tensor for NaN to avoid graph breaks
+                scalars[f"nepa_cluster_loss_at_stage_{stage_idx}"] = torch.tensor(float("nan"), device=x.device, dtype=x.dtype)
+                scalars[f"nepa_pred_loss_at_stage_{stage_idx}"] = torch.tensor(float("nan"), device=x.device, dtype=x.dtype)
+                scalars[f"nepa_cluster_entropy_at_stage_{stage_idx}"] = torch.tensor(float("nan"), device=x.device, dtype=x.dtype)
+                scalars[f"nepa_cluster_mean_entropy_at_stage_{stage_idx}"] = torch.tensor(float("nan"), device=x.device, dtype=x.dtype)
+
+            if stage_idx > 0:
+                # Unpool, shift & skip-connection
+                x = self.nepa[f"unpool_{stage_idx}->{stage_idx - 1}"](x)
+                skip_connection = encoder_outputs[stage_idx - 1]
+                if x.size(1) == skip_connection.size(1):
+                    x = x[:, :-1]
+                shifted_x = torch.zeros_like(skip_connection)
+                shifted_x[:, 1:] = x
+                x = skip_connection + shifted_x
+        scalars["total_nepa_loss"] = total_nepa_loss.detach()
+
+        return total_nepa_loss + probing_loss, scalars
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
