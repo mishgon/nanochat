@@ -215,9 +215,10 @@ class UNet(nn.Module):
 
         # Encoder, decoder
         for stage_idx in range(self.n_stage):
-            s = 3**0.5 * self.config.n_embd[stage_idx]**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+            n_embd = self.config.n_embd[stage_idx]
+            s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
             if stage_idx > 0:
-                torch.nn.init.normal_(self.encoder[f"pool_{stage_idx - 1}->{stage_idx}"].c_proj.weight, mean=0.0, std=0.001)
+                torch.nn.init.normal_(self.encoder[f"pool_{stage_idx - 1}->{stage_idx}"].c_proj.weight, mean=0.0, std=1.0)
             for block in itertools.chain(self.encoder[f"transformer_{stage_idx}"],
                                          self.decoder[f"transformer_{stage_idx}"]):
                 torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
@@ -227,7 +228,7 @@ class UNet(nn.Module):
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
             if stage_idx > 0:
-                torch.nn.init.normal_(self.decoder[f"unpool_{stage_idx}->{stage_idx - 1}"].c_proj.weight, mean=0.0, std=0.001)
+                torch.nn.init.normal_(self.decoder[f"unpool_{stage_idx}->{stage_idx - 1}"].c_proj.weight, mean=0.0, std=n_embd ** -0.5)
 
         # Rotary embeddings
         head_dim = self.config.n_embd[0] // self.config.n_head[0]

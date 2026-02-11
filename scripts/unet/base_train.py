@@ -47,7 +47,7 @@ parser.add_argument("--model-dim", type=ast.literal_eval, default="(1280, 2560)"
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 # Training horizon (only one used, in order of precedence)
-parser.add_argument("--num-iterations", type=int, default=10_000, help="explicit number of optimization steps (-1 = disable)")
+parser.add_argument("--num-iterations", type=int, default=100_000, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=int, default=-1.0, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
