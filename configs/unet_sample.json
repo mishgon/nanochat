@@ -1,0 +1,18 @@
+{
+  "model_type": "unet",
+  "n_layer_per_stage": [
+    [5, 5],
+    [10, 10],
+    [8, 8]
+  ],
+  "n_embd_per_stage": [1280, 2560, 5120],
+  "n_head_per_stage": [20, 40, 80],
+  "n_kv_head_per_stage": [20, 40, 80],
+  "sequence_len": 2048,
+  "vocab_size": 32768,
+  "prompt_len": 1024,
+  "num_tokens": 100,
+  "warmup": 10,
+  "num_runs": 1,
+  "use_timing": false
+}
