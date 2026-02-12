@@ -417,7 +417,7 @@ class Engine:
                     state.python_expr_tokens.append(next_token)
 
             # Yield the token column with timing info
-            yield token_column, token_masks, timing_info.copy()
+            yield token_column, token_masks, timing_info["token_times"][-1] if len(timing_info["token_times"]) > 0 else 0.0
             num_generated += 1
 
             # Prepare logits for next iteration with timing

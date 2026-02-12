@@ -18,6 +18,8 @@ import time
 import argparse
 import json
 import os
+from datetime import datetime
+from collections import deque
 from contextlib import nullcontext
 from tqdm import tqdm
 from nanochat.common import compute_init, autodetect_device_type, print0, get_base_dir
@@ -220,6 +222,18 @@ def benchmark_gpt_w_timing(model, device, prompt_len=1024, num_decode_tokens=100
     
     total_tokens = warmup + num_decode_tokens
     
+    # Track timing information
+    prefill_time = None
+    token_times = []
+    last_100_times = deque(maxlen=100)  # For rolling average
+    
+    # Progress bar with throttled updates
+    # Update every 10 tokens or every 0.1 seconds, whichever comes first
+    update_interval_tokens = 1000
+    update_interval_seconds = 0.5
+    last_update_time = time.time()
+    last_update_token = 0
+    
     with autocast_ctx:
         generate_iter = engine.generate_w_timing(
             prompt_tokens,
@@ -230,24 +244,54 @@ def benchmark_gpt_w_timing(model, device, prompt_len=1024, num_decode_tokens=100
             ignore_assistant_end=true
         )
         
-        # Collect all timing information
-        token_count = 0
-        final_timing_info = None
+        # Initialize progress bar
+        pbar = tqdm(total=total_tokens, desc="Generating", unit="tok", leave=False)
         
-        for token_column, token_masks, timing_info in generate_iter:
+        token_count = 0
+        current_time = time.time()
+        
+        # Engine yields: (token_column, token_masks, current_token_time)
+        for token_column, token_masks, current_token_time in generate_iter:
             token_count += 1
-            final_timing_info = timing_info
-            # Continue until we've generated all tokens
+            current_time = time.time()
+            
+            # Track token times
+            if current_token_time > 0:
+                token_times.append(current_token_time)
+                last_100_times.append(current_token_time)
+            
+            # Calculate average of last 100 tokens
+            avg_last_100 = sum(last_100_times) / len(last_100_times) if last_100_times else 0.0
+            
+            # Update progress bar with throttling
+            should_update = (
+                token_count - last_update_token >= update_interval_tokens or
+                current_time - last_update_time >= update_interval_seconds or
+                token_count == total_tokens
+            )
+            
+            if should_update:
+                # Format timing info for display
+                current_time_str = f"{current_token_time*1000:.2f}ms" if current_token_time > 0 else "N/A"
+                avg_time_str = f"{avg_last_100*1000:.2f}ms" if avg_last_100 > 0 else "N/A"
+                
+                pbar.set_postfix({
+                    'current': current_time_str,
+                    'avg100': avg_time_str
+                })
+                pbar.update(token_count - last_update_token)
+                last_update_token = token_count
+                last_update_time = current_time
+        
+        pbar.close()
     
     synchronize()
     
-    if final_timing_info is None:
+    if len(token_times) == 0:
         raise RuntimeError("No timing information collected")
     
     # Extract only decode tokens (skip warmup)
-    # Note: timing_info includes all tokens, but we want to skip warmup
-    all_token_times = final_timing_info['token_times']
-    decode_token_times = all_token_times[warmup:] if len(all_token_times) > warmup else []
+    decode_token_times = token_times[warmup:] if len(token_times) > warmup else []
     
     # Recalculate decode_times from decode tokens only
     decode_times = []
@@ -257,7 +301,7 @@ def benchmark_gpt_w_timing(model, device, prompt_len=1024, num_decode_tokens=100
         decode_times.append(cumulative)
     
     return {
-        'prefill_time': final_timing_info['prefill_time'],
+        'prefill_time': prefill_time,
         'decode_times': decode_times,
         'token_times': decode_token_times,
         'num_decode_tokens': len(decode_token_times),
@@ -294,6 +338,18 @@ def benchmark_unet_w_timing(model, device, prompt_len=1024, num_decode_tokens=10
     
     total_tokens = warmup + num_decode_tokens
     
+    # Track timing information
+    prefill_time = None
+    token_times = []
+    last_100_times = deque(maxlen=100)  # For rolling average
+    
+    # Progress bar with throttled updates
+    # Update every 10 tokens or every 0.1 seconds, whichever comes first
+    update_interval_tokens = 10
+    update_interval_seconds = 0.1
+    last_update_time = time.time()
+    last_update_token = 0
+    
     with autocast_ctx:
         generate_iter = engine.generate_w_timing(
             prompt_tokens,
@@ -304,24 +360,54 @@ def benchmark_unet_w_timing(model, device, prompt_len=1024, num_decode_tokens=10
             ignore_assistant_end=True
         )
         
-        # Collect all timing information
-        token_count = 0
-        final_timing_info = None
+        # Initialize progress bar
+        pbar = tqdm(total=total_tokens, desc="Generating", unit="tok", leave=False)
         
-        for token_column, token_masks, timing_info in generate_iter:
+        token_count = 0
+        current_time = time.time()
+        
+        # Engine yields: (token_column, token_masks, current_token_time)
+        for token_column, token_masks, current_token_time in generate_iter:
             token_count += 1
-            final_timing_info = timing_info
-            # Continue until we've generated all tokens
+            current_time = time.time()
+            
+            # Track token times
+            if current_token_time > 0:
+                token_times.append(current_token_time)
+                last_100_times.append(current_token_time)
+            
+            # Calculate average of last 100 tokens
+            avg_last_100 = sum(last_100_times) / len(last_100_times) if last_100_times else 0.0
+            
+            # Update progress bar with throttling
+            should_update = (
+                token_count - last_update_token >= update_interval_tokens or
+                current_time - last_update_time >= update_interval_seconds or
+                token_count == total_tokens
+            )
+            
+            if should_update:
+                # Format timing info for display
+                current_time_str = f"{current_token_time*1000:.2f}ms" if current_token_time > 0 else "N/A"
+                avg_time_str = f"{avg_last_100*1000:.2f}ms" if avg_last_100 > 0 else "N/A"
+                
+                pbar.set_postfix({
+                    'current': current_time_str,
+                    'avg100': avg_time_str
+                })
+                pbar.update(token_count - last_update_token)
+                last_update_token = token_count
+                last_update_time = current_time
+        
+        pbar.close()
     
     synchronize()
     
-    if final_timing_info is None:
+    if len(token_times) == 0:
         raise RuntimeError("No timing information collected")
     
     # Extract only decode tokens (skip warmup)
-    # Note: timing_info includes all tokens, but we want to skip warmup
-    all_token_times = final_timing_info['token_times']
-    decode_token_times = all_token_times[warmup:] if len(all_token_times) > warmup else []
+    decode_token_times = token_times[warmup:] if len(token_times) > warmup else []
     
     # Recalculate decode_times from decode tokens only
     decode_times = []
@@ -331,7 +417,7 @@ def benchmark_unet_w_timing(model, device, prompt_len=1024, num_decode_tokens=10
         decode_times.append(cumulative)
     
     return {
-        'prefill_time': final_timing_info['prefill_time'],
+        'prefill_time': prefill_time,
         'decode_times': decode_times,
         'token_times': decode_token_times,
         'num_decode_tokens': len(decode_token_times),
@@ -363,8 +449,20 @@ def create_gpt_model(n_embd, n_layer, n_head, n_kv_head, vocab_size=32768, seque
 
 def create_unet_model(n_layer_per_stage, n_embd_per_stage, n_head_per_stage, n_kv_head_per_stage, vocab_size=32768, sequence_len=2048, device=None):
     """Create a randomly initialized UNet model."""
-    # Ensure all n_layer values are even (UNet requirement)
-    n_layer_per_stage = tuple(max(0, (n // 2) * 2) for n in n_layer_per_stage)
+    # n_layer_per_stage should be a sequence of tuples (encoder_n_layer, decoder_n_layer)
+    # Ensure all n_layer values are even (UNet requirement) and convert to tuples if needed
+    n_layer_tuples = []
+    for n_layer in n_layer_per_stage:
+        if isinstance(n_layer, tuple):
+            # Already a tuple, ensure both values are even
+            encoder_n = max(0, (n_layer[0] // 2) * 2)
+            decoder_n = max(0, (n_layer[1] // 2) * 2)
+            n_layer_tuples.append((encoder_n, decoder_n))
+        else:
+            # Single integer, split evenly between encoder and decoder
+            n = max(0, (n_layer // 2) * 2)
+            n_layer_tuples.append((n // 2, n // 2))
+    n_layer_per_stage = tuple(n_layer_tuples)
     
     config = UNetConfig(
         sequence_len=sequence_len,
@@ -408,10 +506,23 @@ def save_timing_results(config_name, config_dict, measurements, base_dir):
     # Create directory structure: $NANOCHAT_BASE_DIR/charts/runs/{config_name}/
     charts_dir = os.path.join(base_dir, "charts", "runs")
     config_dir = os.path.join(charts_dir, config_name)
+    
+    # Check if directory exists and if results.json already exists
+    dir_exists = os.path.exists(config_dir)
+    default_json_path = os.path.join(config_dir, "results.json")
+    results_json_exists = os.path.exists(default_json_path)
+    
+    # Create directory if it doesn't exist
     os.makedirs(config_dir, exist_ok=True)
     
-    # Create JSON file with config and measurements
-    json_path = os.path.join(config_dir, "results.json")
+    # If directory existed and results.json exists, use timestamped filename
+    if dir_exists and results_json_exists:
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        json_filename = f"results_{timestamp}.json"
+    else:
+        json_filename = "results.json"
+    
+    json_path = os.path.join(config_dir, json_filename)
     results = {
         "config": config_dict,
         "measurements": measurements
@@ -502,8 +613,12 @@ def main():
             raise ValueError("--stage is required for UNet models")
         
         n_stages = args.stage + 1
-        n_layer_per_stage = [0] * n_stages
-        n_layer_per_stage[args.stage] = args.n_layer
+        # n_layer_per_stage should be tuples of (encoder_n_layer, decoder_n_layer)
+        # Split args.n_layer evenly between encoder and decoder
+        encoder_n = (args.n_layer // 2)
+        decoder_n = args.n_layer - encoder_n  # Handle odd numbers
+        n_layer_per_stage = [(0, 0)] * n_stages
+        n_layer_per_stage[args.stage] = (encoder_n, decoder_n)
         
         # For hidden sizes, we need to set all stages
         # Stage 0 typically has smaller hidden size, but we want to test the target stage
