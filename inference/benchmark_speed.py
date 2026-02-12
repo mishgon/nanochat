@@ -482,8 +482,50 @@ def create_unet_model(n_layer_per_stage, n_embd_per_stage, n_head_per_stage, n_k
     return model
 
 
-def generate_config_name(args):
-    """Generate a config name from arguments."""
+def load_config_from_file(config_path):
+    """Load configuration from JSON file.
+    
+    Supports both absolute and relative paths. Relative paths are resolved
+    relative to the project root or current working directory.
+    """
+    # If relative path, try resolving relative to project root first, then cwd
+    if not os.path.isabs(config_path):
+        project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        config_path_in_project = os.path.join(project_root, config_path)
+        if os.path.exists(config_path_in_project):
+            config_path = config_path_in_project
+        elif not os.path.exists(config_path):
+            # Try relative to project root configs folder
+            config_path_in_configs = os.path.join(project_root, "configs", config_path)
+            if os.path.exists(config_path_in_configs):
+                config_path = config_path_in_configs
+    
+    if not os.path.exists(config_path):
+        raise FileNotFoundError(f"Config file not found: {config_path}")
+    
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+    return config
+
+
+def generate_config_name(args, config_dict=None):
+    """Generate a config name from arguments or config dict."""
+    if config_dict:
+        # Use config dict if provided
+        parts = [f"model={config_dict.get('model_type', 'unet')}"]
+        if config_dict.get('model_type') == 'gpt':
+            parts.append(f"embd={config_dict.get('n_embd', 'unknown')}")
+            parts.append(f"layer={config_dict.get('n_layer', 'unknown')}")
+        else:
+            # UNet: use stage info from config
+            n_layer_per_stage = config_dict.get('n_layer_per_stage', [])
+            parts.append(f"stages={len(n_layer_per_stage)}")
+            parts.append(f"embd={config_dict.get('n_embd_per_stage', ['unknown'])[0] if n_layer_per_stage else 'unknown'}")
+        parts.append(f"prompt={config_dict.get('prompt_len', 1024)}")
+        parts.append(f"tokens={config_dict.get('num_tokens', 100)}")
+        return "_".join(parts)
+    
+    # Original logic for args
     parts = [f"model={args.model_type}"]
     if args.model_type == "gpt":
         parts.append(f"embd={args.n_embd}")
@@ -536,7 +578,8 @@ def save_timing_results(config_name, config_dict, measurements, base_dir):
 
 def main():
     parser = argparse.ArgumentParser(description="Benchmark inference speed")
-    parser.add_argument("--model-type", type=str, choices=["gpt", "unet"], required=True)
+    parser.add_argument("--config", type=str, default=None, help="Path to JSON config file (overrides other args)")
+    parser.add_argument("--model-type", type=str, choices=["gpt", "unet"], required=False)
     parser.add_argument("--n-embd", type=int, help="Hidden size (GPT) or hidden size for target stage (UNet)")
     parser.add_argument("--n-layer", type=int, default=16, help="Number of layers (GPT) or total layers (UNet)")
     parser.add_argument("--stage", type=int, default=None, help="UNet stage to put all layers on (0-indexed)")
@@ -550,6 +593,30 @@ def main():
     parser.add_argument("--use-timing", action="store_true", help="Use generate_w_timing for detailed per-token timing and save to JSON")
     
     args = parser.parse_args()
+    
+    # Load config from file if provided
+    config_dict = None
+    if args.config:
+        config_dict = load_config_from_file(args.config)
+        # Override args with config values
+        if 'model_type' in config_dict:
+            args.model_type = config_dict['model_type']
+        if 'prompt_len' in config_dict:
+            args.prompt_len = config_dict['prompt_len']
+        if 'num_tokens' in config_dict:
+            args.num_tokens = config_dict['num_tokens']
+        if 'warmup' in config_dict:
+            args.warmup = config_dict['warmup']
+        if 'num_runs' in config_dict:
+            args.num_runs = config_dict['num_runs']
+        if 'use_timing' in config_dict:
+            args.use_timing = config_dict['use_timing']
+        if 'sequence_len' in config_dict:
+            args.sequence_len = config_dict['sequence_len']
+    
+    # Validate required args
+    if not args.model_type:
+        raise ValueError("--model-type is required (or specify --config)")
     
     # Init compute
     device_type = autodetect_device_type()
@@ -573,7 +640,7 @@ def main():
         if args.use_timing:
             # Use detailed timing method
             measurements = benchmark_gpt_w_timing(model, device, args.prompt_len, args.num_tokens, args.warmup)
-            config_dict = {
+            saved_config_dict = {
                 "model_type": "gpt",
                 "n_embd": args.n_embd,
                 "n_layer": args.n_layer,
@@ -584,9 +651,9 @@ def main():
                 "num_tokens": args.num_tokens,
                 "warmup": args.warmup,
             }
-            config_name = generate_config_name(args)
+            config_name = generate_config_name(args, saved_config_dict)
             base_dir = get_base_dir()
-            save_timing_results(config_name, config_dict, measurements, base_dir)
+            save_timing_results(config_name, saved_config_dict, measurements, base_dir)
             
             # Print summary
             avg_token_time = sum(measurements['token_times']) / len(measurements['token_times'])
@@ -608,77 +675,116 @@ def main():
                 print0(f"GPT tokens/sec: {mean:.2f} ± {std:.2f} (mean ± std over {args.num_runs} runs)")
         
     elif args.model_type == "unet":
-        # UNet model - all layers on specified stage
-        if args.stage is None:
-            raise ValueError("--stage is required for UNet models")
-        
-        n_stages = args.stage + 1
-        # n_layer_per_stage should be tuples of (encoder_n_layer, decoder_n_layer)
-        # Split args.n_layer evenly between encoder and decoder
-        encoder_n = (args.n_layer // 2)
-        decoder_n = args.n_layer - encoder_n  # Handle odd numbers
-        n_layer_per_stage = [(0, 0)] * n_stages
-        n_layer_per_stage[args.stage] = (encoder_n, decoder_n)
-        
-        # For hidden sizes, we need to set all stages
-        # Stage 0 typically has smaller hidden size, but we want to test the target stage
-        # Let's use a simple scaling: each stage doubles the hidden size
-        # But for this experiment, we want to test the target stage's hidden size
-        n_embd_per_stage = []
-        n_head_per_stage = []
-        n_kv_head_per_stage = []
-        
-        # Calculate base hidden size for stage 0
-        # If target stage > 0, stage 0 should be smaller
-        base_embd = args.n_embd // (2 ** args.stage) if args.stage > 0 else args.n_embd
-        # Ensure base_embd is at least 64 for reasonable model
-        base_embd = max(64, base_embd)
-        
-        for s in range(n_stages):
-            if s == 0:
-                embd = base_embd
-            else:
-                # Higher stages: double the hidden size
-                embd = n_embd_per_stage[s-1] * 2
+        # UNet model - support arbitrary configs from file or args
+        if config_dict and 'n_layer_per_stage' in config_dict:
+            # Load from config file - supports arbitrary layer configurations
+            n_layer_per_stage = [tuple(layer) if isinstance(layer, list) else layer for layer in config_dict['n_layer_per_stage']]
+            n_embd_per_stage = config_dict['n_embd_per_stage']
+            n_head_per_stage = config_dict.get('n_head_per_stage', [])
+            n_kv_head_per_stage = config_dict.get('n_kv_head_per_stage', [])
+            vocab_size = config_dict.get('vocab_size', 32768)
             
-            n_embd_per_stage.append(embd)
-            n_head = args.n_head if args.n_head else max(1, embd // 64)
-            n_kv_head = args.n_kv_head if args.n_kv_head else n_head
-            n_head_per_stage.append(n_head)
-            n_kv_head_per_stage.append(n_kv_head)
-        
-        # Override target stage with specified hidden size
-        n_embd_per_stage[args.stage] = args.n_embd
-        n_head_per_stage[args.stage] = args.n_head if args.n_head else max(1, args.n_embd // 64)
-        n_kv_head_per_stage[args.stage] = args.n_kv_head if args.n_kv_head else n_head_per_stage[args.stage]
-        
-        # Ensure head_dim is consistent across stages (UNet requirement)
-        head_dim_base = n_embd_per_stage[0] // n_head_per_stage[0]
-        for s in range(n_stages):
-            # Adjust n_head to maintain consistent head_dim
-            n_head_per_stage[s] = n_embd_per_stage[s] // head_dim_base
-            n_kv_head_per_stage[s] = min(n_kv_head_per_stage[s], n_head_per_stage[s])
-        
-        # Set sequence_len to accommodate prompt + warmup + decode tokens
-        # Rotary embeddings are precomputed as sequence_len * 10, so we need enough headroom
-        if args.sequence_len is None:
-            max_seq_len = args.prompt_len + args.warmup + args.num_tokens
-            # Round up to next power of 2 for efficiency, with minimum of 2048
-            sequence_len = max(2048, 2 ** (max_seq_len - 1).bit_length())
+            n_stages = len(n_layer_per_stage)
+            
+            # Auto-calculate heads if not provided
+            if not n_head_per_stage:
+                n_head_per_stage = [max(1, embd // 64) for embd in n_embd_per_stage]
+            if not n_kv_head_per_stage:
+                n_kv_head_per_stage = n_head_per_stage.copy()
+            
+            # Ensure head_dim is consistent across stages (UNet requirement)
+            head_dim_base = n_embd_per_stage[0] // n_head_per_stage[0]
+            for s in range(n_stages):
+                # Adjust n_head to maintain consistent head_dim
+                n_head_per_stage[s] = n_embd_per_stage[s] // head_dim_base
+                n_kv_head_per_stage[s] = min(n_kv_head_per_stage[s], n_head_per_stage[s])
+            
+            # Set sequence_len
+            if args.sequence_len is None:
+                if 'sequence_len' in config_dict:
+                    sequence_len = config_dict['sequence_len']
+                else:
+                    max_seq_len = args.prompt_len + args.warmup + args.num_tokens
+                    sequence_len = max(2048, 2 ** (max_seq_len - 1).bit_length())
+            else:
+                sequence_len = args.sequence_len
+            
         else:
-            sequence_len = args.sequence_len
+            # Original logic: all layers on specified stage
+            if args.stage is None:
+                raise ValueError("--stage is required for UNet models when not using --config")
+            
+            n_stages = args.stage + 1
+            # n_layer_per_stage should be tuples of (encoder_n_layer, decoder_n_layer)
+            # Split args.n_layer evenly between encoder and decoder
+            encoder_n = (args.n_layer // 2)
+            decoder_n = args.n_layer - encoder_n  # Handle odd numbers
+            n_layer_per_stage = [(0, 0)] * n_stages
+            n_layer_per_stage[args.stage] = (encoder_n, decoder_n)
+            
+            # For hidden sizes, we need to set all stages
+            # Stage 0 typically has smaller hidden size, but we want to test the target stage
+            # Let's use a simple scaling: each stage doubles the hidden size
+            # But for this experiment, we want to test the target stage's hidden size
+            n_embd_per_stage = []
+            n_head_per_stage = []
+            n_kv_head_per_stage = []
+            
+            # Calculate base hidden size for stage 0
+            # If target stage > 0, stage 0 should be smaller
+            base_embd = args.n_embd // (2 ** args.stage) if args.stage > 0 else args.n_embd
+            # Ensure base_embd is at least 64 for reasonable model
+            base_embd = max(64, base_embd)
+            
+            for s in range(n_stages):
+                if s == 0:
+                    embd = base_embd
+                else:
+                    # Higher stages: double the hidden size
+                    embd = n_embd_per_stage[s-1] * 2
+                
+                n_embd_per_stage.append(embd)
+                n_head = args.n_head if args.n_head else max(1, embd // 64)
+                n_kv_head = args.n_kv_head if args.n_kv_head else n_head
+                n_head_per_stage.append(n_head)
+                n_kv_head_per_stage.append(n_kv_head)
+            
+            # Override target stage with specified hidden size
+            n_embd_per_stage[args.stage] = args.n_embd
+            n_head_per_stage[args.stage] = args.n_head if args.n_head else max(1, args.n_embd // 64)
+            n_kv_head_per_stage[args.stage] = args.n_kv_head if args.n_kv_head else n_head_per_stage[args.stage]
+            
+            # Ensure head_dim is consistent across stages (UNet requirement)
+            head_dim_base = n_embd_per_stage[0] // n_head_per_stage[0]
+            for s in range(n_stages):
+                # Adjust n_head to maintain consistent head_dim
+                n_head_per_stage[s] = n_embd_per_stage[s] // head_dim_base
+                n_kv_head_per_stage[s] = min(n_kv_head_per_stage[s], n_head_per_stage[s])
+            
+            vocab_size = 32768
+            
+            # Set sequence_len to accommodate prompt + warmup + decode tokens
+            # Rotary embeddings are precomputed as sequence_len * 10, so we need enough headroom
+            if args.sequence_len is None:
+                max_seq_len = args.prompt_len + args.warmup + args.num_tokens
+                # Round up to next power of 2 for efficiency, with minimum of 2048
+                sequence_len = max(2048, 2 ** (max_seq_len - 1).bit_length())
+            else:
+                sequence_len = args.sequence_len
         
-        print0(f"Creating UNet model: stage={args.stage}, n_layer_per_stage={n_layer_per_stage}")
+        print0(f"Creating UNet model: n_layer_per_stage={n_layer_per_stage}")
         print0(f"  n_embd_per_stage={n_embd_per_stage}")
         print0(f"  n_head_per_stage={n_head_per_stage}")
         print0(f"  n_kv_head_per_stage={n_kv_head_per_stage}")
         print0(f"  sequence_len={sequence_len}")
+        print0(f"  vocab_size={vocab_size}")
         
         model = create_unet_model(
             tuple(n_layer_per_stage),
             tuple(n_embd_per_stage),
             tuple(n_head_per_stage),
             tuple(n_kv_head_per_stage),
+            vocab_size=vocab_size,
             sequence_len=sequence_len,
             device=device
         )
@@ -686,28 +792,28 @@ def main():
         if args.use_timing:
             # Use detailed timing method
             measurements = benchmark_unet_w_timing(model, device, args.prompt_len, args.num_tokens, args.warmup)
-            config_dict = {
+            saved_config_dict = {
                 "model_type": "unet",
-                "stage": args.stage,
                 "n_layer_per_stage": n_layer_per_stage,
                 "n_embd_per_stage": n_embd_per_stage,
                 "n_head_per_stage": n_head_per_stage,
                 "n_kv_head_per_stage": n_kv_head_per_stage,
                 "sequence_len": sequence_len,
+                "vocab_size": vocab_size,
                 "prompt_len": args.prompt_len,
                 "num_tokens": args.num_tokens,
                 "warmup": args.warmup,
             }
-            config_name = generate_config_name(args)
+            config_name = generate_config_name(args, saved_config_dict)
             base_dir = get_base_dir()
-            save_timing_results(config_name, config_dict, measurements, base_dir)
+            save_timing_results(config_name, saved_config_dict, measurements, base_dir)
             
             # Print summary
             avg_token_time = sum(measurements['token_times']) / len(measurements['token_times'])
             tokens_per_sec = 1.0 / avg_token_time
-            print0(f"UNet (stage {args.stage}) prefill time: {measurements['prefill_time']:.4f}s")
-            print0(f"UNet (stage {args.stage}) avg token time: {avg_token_time:.6f}s")
-            print0(f"UNet (stage {args.stage}) tokens/sec: {tokens_per_sec:.2f}")
+            print0(f"UNet prefill time: {measurements['prefill_time']:.4f}s")
+            print0(f"UNet avg token time: {avg_token_time:.6f}s")
+            print0(f"UNet tokens/sec: {tokens_per_sec:.2f}")
         else:
             # Use standard benchmark method
             result = benchmark_unet(model, device, args.prompt_len, args.num_tokens, args.warmup, args.num_runs)
@@ -715,11 +821,11 @@ def main():
                 tokens_per_sec = result
                 mean = result
                 std = 0.0
-                print0(f"UNet (stage {args.stage}) tokens/sec: {tokens_per_sec:.2f}")
+                print0(f"UNet tokens/sec: {tokens_per_sec:.2f}")
             else:
                 mean, std = result
                 tokens_per_sec = mean
-                print0(f"UNet (stage {args.stage}) tokens/sec: {mean:.2f} ± {std:.2f} (mean ± std over {args.num_runs} runs)")
+                print0(f"UNet tokens/sec: {mean:.2f} ± {std:.2f} (mean ± std over {args.num_runs} runs)")
         
     # Output result in a parseable format (only for non-timing mode)
     if not args.use_timing:
