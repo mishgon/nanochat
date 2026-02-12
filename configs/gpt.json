@@ -1,0 +1,13 @@
+{
+    "model_type": "gpt",
+    "n_layer": 20,
+    "n_embd": 1280,
+    "n_head": 10,
+    "n_kv_head": 10,
+    "vocab_size": 32768,
+    "prompt_len": 1024,
+    "num_tokens": 20000,
+    "warmup": 10,
+    "num_runs": 1,
+    "use_timing": true
+  }

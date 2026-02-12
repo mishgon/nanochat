@@ -601,6 +601,14 @@ def main():
         # Override args with config values
         if 'model_type' in config_dict:
             args.model_type = config_dict['model_type']
+        if 'n_embd' in config_dict:
+            args.n_embd = config_dict['n_embd']
+        if 'n_layer' in config_dict:
+            args.n_layer = config_dict['n_layer']
+        if 'n_head' in config_dict:
+            args.n_head = config_dict['n_head']
+        if 'n_kv_head' in config_dict:
+            args.n_kv_head = config_dict['n_kv_head']
         if 'prompt_len' in config_dict:
             args.prompt_len = config_dict['prompt_len']
         if 'num_tokens' in config_dict:
@@ -624,6 +632,8 @@ def main():
     
     if args.model_type == "gpt":
         # GPT model
+        if args.n_embd is None:
+            raise ValueError("n_embd is required (specify --n-embd or include it in --config)")
         n_head = args.n_head if args.n_head else max(1, args.n_embd // 64)
         n_kv_head = args.n_kv_head if args.n_kv_head else n_head
         # Set sequence_len to accommodate prompt + warmup + decode tokens
