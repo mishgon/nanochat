@@ -2,14 +2,12 @@
 Analyze token generation times from nanochat benchmark runs.
 
 Parses JSON files from nanochat_base_dir/charts/runs/, filters runs with >10k tokens,
-groups them by model type (and stage for UNet), and plots average time per token
-for bands of 100 tokens.
+and plots average time per token for bands of 100 tokens for each individual run.
 """
 
 import json
 import os
 import glob
-from collections import defaultdict
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
@@ -32,14 +30,13 @@ def parse_json_file(filepath):
         return None, None
 
 
-def get_group_key(config):
-    """Get a grouping key from config (model_type and stage for UNet)."""
-    model_type = config.get('model_type', 'unknown')
-    if model_type == 'unet':
-        stage = config.get('stage', 'unknown')
-        return f"unet_stage_{stage}"
-    else:
-        return model_type
+def get_run_name(filepath):
+    """Extract run name from filepath (directory name containing results.json)."""
+    # Filepath is like: /path/to/charts/runs/{run_name}/results.json
+    # or /path/to/charts/runs/{run_name}/results_{timestamp}.json
+    dir_path = os.path.dirname(filepath)
+    run_name = os.path.basename(dir_path)
+    return run_name
 
 
 def calculate_token_bands(token_times, band_size=100):
@@ -73,7 +70,7 @@ def calculate_token_bands(token_times, band_size=100):
 
 
 def main():
-    """Main function to parse, group, and plot token times."""
+    """Main function to parse and plot token times for each individual run."""
     base_dir = get_nanochat_base_dir()
     runs_dir = os.path.join(base_dir, 'charts', 'runs')
     charts_dir = os.path.join(base_dir, 'charts')
@@ -85,16 +82,14 @@ def main():
     # Ensure charts directory exists
     os.makedirs(charts_dir, exist_ok=True)
     
-    # Find all results.json files
-    pattern = os.path.join(runs_dir, '**', 'results.json')
+    # Find all results.json files (including timestamped ones)
+    pattern = os.path.join(runs_dir, '**', 'results*.json')
     json_files = glob.glob(pattern, recursive=True)
     
     print(f"Found {len(json_files)} JSON files")
     
-    # Group data by model type and stage
-    grouped_data = defaultdict(list)
-    
     # Parse all files and filter by num_tokens > 10000
+    runs_data = []
     for json_file in json_files:
         config, measurements = parse_json_file(json_file)
         
@@ -109,61 +104,30 @@ def main():
         if not token_times:
             continue
         
-        group_key = get_group_key(config)
-        grouped_data[group_key].append({
+        run_name = get_run_name(json_file)
+        runs_data.append({
+            'run_name': run_name,
             'token_times': token_times,
             'num_tokens': num_tokens,
             'config': config
         })
     
-    print(f"\nFound {sum(len(runs) for runs in grouped_data.values())} runs with >10k tokens")
-    print(f"Grouped into {len(grouped_data)} groups:")
-    for key, runs in grouped_data.items():
-        print(f"  {key}: {len(runs)} runs")
+    print(f"\nFound {len(runs_data)} runs with >10k tokens")
     
-    if not grouped_data:
+    if not runs_data:
         print("No data to plot!")
         return
     
-    # Calculate average bands for each group
-    group_bands = {}
-    for group_key, runs in grouped_data.items():
-        all_bands = []
-        
-        for run in runs:
-            token_times = run['token_times']
-            bands = calculate_token_bands(token_times, band_size=100)
-            all_bands.append(bands)
-        
-        # Average across all runs for each band position
-        if all_bands:
-            # Find the maximum number of bands
-            max_bands = max(len(bands) for bands in all_bands)
-            
-            # For each band position, average across runs
-            averaged_bands = []
-            for band_idx in range(max_bands):
-                band_times = []
-                for bands in all_bands:
-                    if band_idx < len(bands):
-                        band_times.append(bands[band_idx][1])  # Get the avg_time
-                
-                if band_times:
-                    # Use the band center from the first run that has this band
-                    band_center = None
-                    for bands in all_bands:
-                        if band_idx < len(bands):
-                            band_center = bands[band_idx][0]
-                            break
-                    
-                    if band_center is not None:
-                        avg_time = np.mean(band_times)
-                        averaged_bands.append((band_center, avg_time))
-            
-            group_bands[group_key] = averaged_bands
+    # Calculate bands for each run
+    run_bands = {}
+    for run in runs_data:
+        run_name = run['run_name']
+        token_times = run['token_times']
+        bands = calculate_token_bands(token_times, band_size=100)
+        run_bands[run_name] = bands
     
-    # Plot the results
-    plt.figure(figsize=(12, 8))
+    # Plot the results - make figure bigger to accommodate long run names
+    plt.figure(figsize=(16, 10))
     
     # Stylish color palette - modern, vibrant colors
     stylish_colors = [
@@ -179,8 +143,8 @@ def main():
         '#06FFA5',  # Mint
     ]
     
-    # Use stylish colors, cycling if needed
-    for idx, (group_key, bands) in enumerate(group_bands.items()):
+    # Plot each run individually
+    for idx, (run_name, bands) in enumerate(run_bands.items()):
         if not bands:
             continue
         
@@ -188,13 +152,15 @@ def main():
         avg_times = [b[1] * 1000 for b in bands]  # Convert to milliseconds
         
         color = stylish_colors[idx % len(stylish_colors)]
-        plt.plot(band_centers, avg_times, label=group_key, 
+        plt.plot(band_centers, avg_times, label=run_name, 
                 color=color, linewidth=2.5)
     
     plt.xlabel('Token Position (band center)', fontsize=12)
     plt.ylabel('Average Time per Token (ms)', fontsize=12)
     plt.title('Token Generation Time vs Position\n(Averaged over 100-token bands, runs with >10k tokens)', fontsize=14)
-    plt.legend(fontsize=10, framealpha=0.9)
+    
+    # Make legend bigger and place it outside the plot area to accommodate long names
+    plt.legend(fontsize=9, framealpha=0.9, loc='center left', bbox_to_anchor=(1.02, 0.5))
     
     # Enhanced grid - more visible
     plt.grid(True, alpha=0.5, linestyle='-', linewidth=0.8)

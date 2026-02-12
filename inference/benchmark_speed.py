@@ -508,24 +508,80 @@ def load_config_from_file(config_path):
     return config
 
 
-def generate_config_name(args, config_dict=None):
-    """Generate a config name from arguments or config dict."""
+def generate_config_name(args, config_dict=None, config_file_path=None):
+    """Generate a config name from arguments or config dict.
+    
+    Args:
+        args: Parsed arguments
+        config_dict: Dictionary with config values
+        config_file_path: Optional path to config file (used to include filename in name)
+    """
     if config_dict:
-        # Use config dict if provided
-        parts = [f"model={config_dict.get('model_type', 'unet')}"]
+        # Use config dict if provided - include config filename if available
+        parts = []
+        
+        # Include config filename (without extension) if provided
+        if config_file_path:
+            config_filename = os.path.splitext(os.path.basename(config_file_path))[0]
+            parts.append(f"config={config_filename}")
+        
+        parts.append(f"model={config_dict.get('model_type', 'unet')}")
+        
         if config_dict.get('model_type') == 'gpt':
+            # GPT: include all key parameters
             parts.append(f"embd={config_dict.get('n_embd', 'unknown')}")
             parts.append(f"layer={config_dict.get('n_layer', 'unknown')}")
+            if config_dict.get('n_head'):
+                parts.append(f"head={config_dict.get('n_head')}")
+            if config_dict.get('n_kv_head'):
+                parts.append(f"kv_head={config_dict.get('n_kv_head')}")
+            if config_dict.get('vocab_size'):
+                parts.append(f"vocab={config_dict.get('vocab_size')}")
         else:
-            # UNet: use stage info from config
+            # UNet: include comprehensive stage info
             n_layer_per_stage = config_dict.get('n_layer_per_stage', [])
+            n_embd_per_stage = config_dict.get('n_embd_per_stage', [])
+            
             parts.append(f"stages={len(n_layer_per_stage)}")
-            parts.append(f"embd={config_dict.get('n_embd_per_stage', ['unknown'])[0] if n_layer_per_stage else 'unknown'}")
+            
+            # Encode layer configuration: "L[enc,dec]_L[enc,dec]_..."
+            if n_layer_per_stage:
+                layer_strs = []
+                for stage_layers in n_layer_per_stage:
+                    if isinstance(stage_layers, (list, tuple)) and len(stage_layers) == 2:
+                        layer_strs.append(f"{stage_layers[0]},{stage_layers[1]}")
+                    else:
+                        layer_strs.append(str(stage_layers))
+                parts.append(f"layers={'_'.join(layer_strs)}")
+            
+            # Encode embedding sizes: "E[embd]_E[embd]_..."
+            if n_embd_per_stage:
+                embd_strs = [str(e) for e in n_embd_per_stage]
+                parts.append(f"embd={'_'.join(embd_strs)}")
+            
+            # Include head info if available
+            n_head_per_stage = config_dict.get('n_head_per_stage', [])
+            if n_head_per_stage:
+                head_strs = [str(h) for h in n_head_per_stage]
+                parts.append(f"head={'_'.join(head_strs)}")
+            
+            n_kv_head_per_stage = config_dict.get('n_kv_head_per_stage', [])
+            if n_kv_head_per_stage:
+                kv_head_strs = [str(k) for k in n_kv_head_per_stage]
+                parts.append(f"kv_head={'_'.join(kv_head_strs)}")
+            
+            if config_dict.get('vocab_size'):
+                parts.append(f"vocab={config_dict.get('vocab_size')}")
+        
+        # Include benchmark parameters
         parts.append(f"prompt={config_dict.get('prompt_len', 1024)}")
         parts.append(f"tokens={config_dict.get('num_tokens', 100)}")
+        if config_dict.get('warmup', 10) != 10:  # Only include if non-default
+            parts.append(f"warmup={config_dict.get('warmup')}")
+        
         return "_".join(parts)
     
-    # Original logic for args
+    # Original logic for args (when not using config file)
     parts = [f"model={args.model_type}"]
     if args.model_type == "gpt":
         parts.append(f"embd={args.n_embd}")
@@ -596,8 +652,22 @@ def main():
     
     # Load config from file if provided
     config_dict = None
+    config_file_path = None
     if args.config:
-        config_dict = load_config_from_file(args.config)
+        # Resolve config path (similar logic to load_config_from_file)
+        config_file_path = args.config
+        if not os.path.isabs(config_file_path):
+            project_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+            config_path_in_project = os.path.abspath(os.path.join(project_root, config_file_path))
+            if os.path.exists(config_path_in_project):
+                config_file_path = config_path_in_project
+            elif not os.path.exists(config_file_path):
+                config_path_in_configs = os.path.abspath(os.path.join(project_root, "configs", config_file_path))
+                if os.path.exists(config_path_in_configs):
+                    config_file_path = config_path_in_configs
+        # Ensure path is absolute
+        config_file_path = os.path.abspath(config_file_path)
+        config_dict = load_config_from_file(config_file_path)
         # Override args with config values
         if 'model_type' in config_dict:
             args.model_type = config_dict['model_type']
@@ -661,7 +731,7 @@ def main():
                 "num_tokens": args.num_tokens,
                 "warmup": args.warmup,
             }
-            config_name = generate_config_name(args, saved_config_dict)
+            config_name = generate_config_name(args, saved_config_dict, config_file_path)
             base_dir = get_base_dir()
             save_timing_results(config_name, saved_config_dict, measurements, base_dir)
             
@@ -814,7 +884,7 @@ def main():
                 "num_tokens": args.num_tokens,
                 "warmup": args.warmup,
             }
-            config_name = generate_config_name(args, saved_config_dict)
+            config_name = generate_config_name(args, saved_config_dict, config_file_path)
             base_dir = get_base_dir()
             save_timing_results(config_name, saved_config_dict, measurements, base_dir)
             
