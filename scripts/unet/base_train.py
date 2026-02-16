@@ -47,7 +47,7 @@ parser.add_argument("--model-dim", type=ast.literal_eval, default="(1280, 2560)"
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
 # Training horizon (only one used, in order of precedence)
-parser.add_argument("--num-iterations", type=int, default=100_000, help="explicit number of optimization steps (-1 = disable)")
+parser.add_argument("--num-iterations", type=int, default=10_000, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=-1.0, help="calculate num_iterations to reach target_flops (-1 = disable)")
 parser.add_argument("--target-param-data-ratio", type=int, default=-1.0, help="calculate num_iterations to maintain data:param ratio (Chinchilla=20, -1 = disable)")
 # Optimization
@@ -55,6 +55,7 @@ parser.add_argument("--device-batch-size", type=int, default=32, help="per-devic
 parser.add_argument("--total-batch-size", type=int, default=524288, help="total batch size in tokens")
 parser.add_argument("--embedding-lr", type=float, default=0.3, help="learning rate for embedding parameters (Adam)")
 parser.add_argument("--pool-lr", type=float, default=0.004, help="learning rate for pool parameters (Adam)")
+parser.add_argument("--skip-lr", type=float, default=0.004, help="learning rate for skip connection parameters (Adam)")
 parser.add_argument("--unpool-lr", type=float, default=0.004, help="learning rate for unpool parameters (Adam)")
 parser.add_argument("--unembedding-lr", type=float, default=0.004, help="learning rate for unembedding parameters (Adam)")
 parser.add_argument("--matrix-lr", type=float, default=0.02, help="learning rate for matrix parameters (Muon)")
@@ -211,6 +212,7 @@ adam_betas = (args.adam_beta1, args.adam_beta2)
 optimizers = model.setup_optimizers(
     embedding_lr=args.embedding_lr * batch_lr_scale,
     pool_lr=args.pool_lr * batch_lr_scale,
+    skip_lr=args.skip_lr * batch_lr_scale,
     unpool_lr=args.unpool_lr * batch_lr_scale,
     unembedding_lr=args.unembedding_lr * batch_lr_scale,
     matrix_lr=args.matrix_lr * batch_lr_scale,

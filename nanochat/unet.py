@@ -165,6 +165,7 @@ class UNet(nn.Module):
         self.wte = nn.Embedding(padded_vocab_size, config.n_embd[0])
         self.encoder = nn.ModuleDict({})
         self.decoder = nn.ModuleDict({})
+        self.skip_connection = nn.ModuleDict({})
         for stage_idx in range(self.n_stage):
             encoder_n_layer, decoder_n_layer = config.n_layer[stage_idx]
             if stage_idx > 0:
@@ -173,6 +174,7 @@ class UNet(nn.Module):
                 Block(config.n_head[stage_idx], config.n_kv_head[stage_idx], config.n_embd[stage_idx], layer_idx)
                 for layer_idx in range(encoder_n_layer)
             ])
+            self.skip_connection[f"{stage_idx}"] = nn.Linear(config.n_embd[stage_idx], config.n_embd[stage_idx], bias=False)
             self.decoder[f"transformer_{stage_idx}"] = nn.ModuleList([
                 Block(config.n_head[stage_idx], config.n_kv_head[stage_idx], config.n_embd[stage_idx], layer_idx)
                 for layer_idx in range(decoder_n_layer)
@@ -227,6 +229,7 @@ class UNet(nn.Module):
                 torch.nn.init.zeros_(block.attn.c_proj.weight) # projections are zero
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
+            torch.nn.init.normal_(self.skip_connection[f"{stage_idx}"].weight, mean=0.0, std=n_embd ** -0.5)
             if stage_idx > 0:
                 torch.nn.init.normal_(self.decoder[f"unpool_{stage_idx}->{stage_idx - 1}"].c_proj.weight, mean=0.0, std=n_embd ** -0.5)
 
@@ -288,24 +291,26 @@ class UNet(nn.Module):
         """
         return count_params(self)
 
-    def setup_optimizers(self, embedding_lr=0.2, pool_lr=0.004, unpool_lr=0.004, unembedding_lr=0.004, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95)):
+    def setup_optimizers(self, embedding_lr=0.2, pool_lr=0.004, skip_lr=0.004, unpool_lr=0.004, unembedding_lr=0.004, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95)):
         model_dim = self.config.n_embd[0]
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into groups
         embedding_params = list(self.wte.parameters())
         pool_params = []
         matrix_params = []
+        skip_connection_params = []
         unpool_params = []
-        for stage in range(self.n_stage):
-            if stage > 0:
-                pool_params.extend(list(self.encoder[f"pool_{stage - 1}->{stage}"].parameters()))
-            matrix_params.extend(list(self.encoder[f"transformer_{stage}"].parameters()))
-            matrix_params.extend(list(self.decoder[f"transformer_{stage}"].parameters()))
-            if stage > 0:
-                unpool_params.extend(list(self.decoder[f"unpool_{stage}->{stage - 1}"].parameters()))
+        for stage_idx in range(self.n_stage):
+            if stage_idx > 0:
+                pool_params.extend(list(self.encoder[f"pool_{stage_idx - 1}->{stage_idx}"].parameters()))
+            matrix_params.extend(list(self.encoder[f"transformer_{stage_idx}"].parameters()))
+            skip_connection_params.extend(list(self.skip_connection[f"{stage_idx}"].parameters()))
+            matrix_params.extend(list(self.decoder[f"transformer_{stage_idx}"].parameters()))
+            if stage_idx > 0:
+                unpool_params.extend(list(self.decoder[f"unpool_{stage_idx}->{stage_idx - 1}"].parameters()))
         lm_head_params = list(self.lm_head.parameters())
         assert len(list(self.parameters())) == \
-            len(embedding_params) + len(pool_params) + len(matrix_params) + len(unpool_params) + len(lm_head_params)
+            len(embedding_params) + len(pool_params) + len(matrix_params) + len(skip_connection_params) + len(unpool_params) + len(lm_head_params)
         # Create the AdamW optimizer for the embedding, pool, unpool, and lm_head layers
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -313,6 +318,7 @@ class UNet(nn.Module):
         adam_groups = [
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
             dict(params=pool_params, lr=pool_lr * dmodel_lr_scale),
+            dict(params=skip_connection_params, lr=skip_lr * dmodel_lr_scale),
             dict(params=unpool_params, lr=unpool_lr * dmodel_lr_scale),
             dict(params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale),
         ]
@@ -360,10 +366,12 @@ class UNet(nn.Module):
                 # Pool
                 x = self.encoder[f"pool_{stage_idx - 1}->{stage_idx}"](x)
                 x = norm(x)
+
             # Stage
             pooled_cos_sin = pool_cos_sin(*cos_sin, stage_idx)
             for block in self.encoder[f"transformer_{stage_idx}"]:
                 x = block(x, pooled_cos_sin, kv_cache)
+            x = norm(x)
             encoder_outputs.append(x)
 
         # Decoder
@@ -378,11 +386,13 @@ class UNet(nn.Module):
                 # Unpool, shift & skip-connection
                 x = self.decoder[f"unpool_{stage_idx}->{stage_idx - 1}"](x)
                 y = encoder_outputs[stage_idx - 1]
+                y = self.skip_connection[f"{stage_idx}"](y)
                 if x.size(1) == y.size(1):
                     x = x[:, :-1]
                 shifted_x = torch.zeros_like(y)
                 shifted_x[:, 1:] = x
                 x = y + shifted_x
+                x = norm(x)
 
         # Forward the lm_head (compute logits)
         softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
