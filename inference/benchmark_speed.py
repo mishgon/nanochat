@@ -24,7 +24,7 @@ from contextlib import nullcontext
 from tqdm import tqdm
 from nanochat.common import compute_init, autodetect_device_type, print0, get_base_dir
 from nanochat.gpt import GPT, GPTConfig
-from nanochat.unet import UNet, UNetConfig
+from nanochat.ulm import ULM, ULMConfig
 from nanochat.engine import Engine
 from nanochat.tokenizer import get_tokenizer
 from inference.unet_engine import UNetEngine
@@ -464,7 +464,7 @@ def create_unet_model(n_layer_per_stage, n_embd_per_stage, n_head_per_stage, n_k
             n_layer_tuples.append((n // 2, n // 2))
     n_layer_per_stage = tuple(n_layer_tuples)
     
-    config = UNetConfig(
+    config = ULMConfig(
         sequence_len=sequence_len,
         vocab_size=vocab_size,
         n_layer=n_layer_per_stage,
@@ -473,7 +473,7 @@ def create_unet_model(n_layer_per_stage, n_embd_per_stage, n_head_per_stage, n_k
         n_embd=n_embd_per_stage,
     )
     with torch.device("meta"):
-        model = UNet(config)
+        model = ULM(config)
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to_empty(device=device)

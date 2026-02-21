@@ -12,7 +12,7 @@ import os
 import argparse
 import torch
 
-from nanochat.unet import UNet, UNetConfig
+from nanochat.ulm import ULM, ULMConfig
 from nanochat.tokenizer import get_tokenizer
 from nanochat.checkpoint_manager import save_checkpoint
 from nanochat.common import get_base_dir, print0
@@ -93,8 +93,8 @@ def main():
     # Create model on CPU (faster for initialization)
     device = torch.device("cpu")
     with torch.device("meta"):
-        model_config = UNetConfig(**model_config_kwargs)
-        model = UNet(model_config)
+        model_config = ULMConfig(**model_config_kwargs)
+        model = ULM(model_config)
     
     model.to_empty(device=device)
     model.init_weights()
