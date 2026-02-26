@@ -18,6 +18,8 @@ import ast
 import time
 from contextlib import nullcontext
 from collections import defaultdict
+import math
+import itertools
 
 # import wandb
 import torch
@@ -46,6 +48,7 @@ parser.add_argument("--depth", type=ast.literal_eval, default="((2, 2), (2, 2), 
 parser.add_argument("--model-dim", type=int, default=2048, help="hidden size of the model (one or more integers, e.g., '--model-dim=2048')")
 parser.add_argument("--head-dim", type=int, default=128, help="target head dimension for attention")
 parser.add_argument("--max-seq-len", type=int, default=2048, help="max context length")
+parser.add_argument("--codebook-size", type=int, default=1024, help="size of the codebook")
 # Training horizon (only one used, in order of precedence)
 parser.add_argument("--num-iterations", type=int, default=-1, help="explicit number of optimization steps (-1 = disable)")
 parser.add_argument("--target-flops", type=float, default=1e20, help="calculate num_iterations to reach target_flops (-1 = disable)")
@@ -115,8 +118,8 @@ print0(f"Vocab size: {vocab_size:,}")
 # (For very small depths, this gives a slight "unfair" advantage to models with odd depths)
 num_layers = args.depth
 head_dim = args.head_dim
-model_dim = (args.model_dim,) * len(args.depth)
-num_heads = tuple(d // head_dim for d in model_dim)
+model_dim = args.model_dim
+num_heads = model_dim // head_dim
 num_kv_heads = num_heads # default is 1:1 GQA (Group Query Attention) ratio (i.e. GQA is disabled)
 print0(f"num_layers: {num_layers}")
 print0(f"model_dim: {model_dim}")
@@ -147,7 +150,7 @@ if batch_ratio != 1.0:
 
 # Weight decay is tuned at d12 and its scaling seems to be \propto 1/channels^2 (or equivalently, \propto 1/depth^2 due to constant aspect ratio)
 # total_depth = sum(map(sum, args.depth))
-weight_decay_scaled = args.weight_decay * (768 / model_dim[0])**2
+weight_decay_scaled = args.weight_decay * (768 / model_dim)**2
 # if total_depth != 12:
 #     print0(f"Scaling weight decay from {args.weight_decay:.6f} to {weight_decay_scaled:.6f} for depth {args.depth}")
 
@@ -155,7 +158,8 @@ weight_decay_scaled = args.weight_decay * (768 / model_dim[0])**2
 # Initialize the Model
 
 # Create a new model with random weights
-model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers, n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
+model_config_kwargs = dict(sequence_len=args.max_seq_len, vocab_size=vocab_size, n_layer=num_layers,
+                           n_head=num_heads, n_kv_head=num_kv_heads, n_embd=model_dim)
 with torch.device("meta"):
     # All tensors are created as meta tensors (they have shape/dtype but no data)
     model_config = ULMConfig(**model_config_kwargs)
@@ -165,7 +169,7 @@ model.init_weights() # All tensors get initialized
 
 # If we are resuming, overwrite the model parameters with those of the checkpoint
 base_dir = get_base_dir()
-model_tag = args.model_tag if args.model_tag else f"d{args.depth}-h{args.model_dim}".replace(" ", "")
+model_tag = args.model_tag if args.model_tag else f"ulm-d{args.depth}-h{args.model_dim}".replace(" ", "")
 checkpoint_dir = os.path.join(base_dir, "base_checkpoints", model_tag)
 resuming = args.resume_from_step != -1
 if resuming:
@@ -252,6 +256,19 @@ def get_muon_momentum(it):
 def get_weight_decay(it):
     return weight_decay_scaled * (1 - it / num_iterations)
 
+
+def get_ema_momentum(it):
+    warmup_iters = 0  # num_iterations // 10
+    start_warmup_value = 1.0
+    base_value = 0.999
+    final_value = 1.0
+    if it < warmup_iters:
+        return start_warmup_value * (1 - (it + 1) / (warmup_iters + 1)) + base_value * (it + 1) / (warmup_iters + 1)
+    else:
+        return final_value + 0.5 * (base_value - final_value) * (
+            1.0 + math.cos(math.pi * (it - warmup_iters) / (num_iterations - warmup_iters))
+        )
+
 # tensorboard
 tb_logger = SummaryWriter(log_dir=os.path.join(base_dir, "tb_logs", "base", model_tag))
 
@@ -260,16 +277,16 @@ tb_logger = SummaryWriter(log_dir=os.path.join(base_dir, "tb_logs", "base", mode
 
 if not resuming:
     step = 0
-    val_bpb = None # will be set if eval_every > 0
-    min_val_bpb = float("inf")
+    # val_bpb = None # will be set if eval_every > 0
+    # min_val_bpb = float("inf")
     smooth_train_loss = 0 # EMA of training loss
     smooth_train_scalars = defaultdict(lambda: 0)
     total_training_time = 0 # total wall-clock time of training
 else:
     step = meta_data["step"]
     loop_state = meta_data["loop_state"]
-    val_bpb = meta_data["val_bpb"]
-    min_val_bpb = loop_state["min_val_bpb"]
+    # val_bpb = meta_data["val_bpb"]
+    # min_val_bpb = loop_state["min_val_bpb"]
     smooth_train_loss = loop_state["smooth_train_loss"]
     smooth_train_scalars = loop_state["smooth_train_scalars"]
     total_training_time = loop_state["total_training_time"]
@@ -280,66 +297,66 @@ while True:
     last_step = step == num_iterations # loop runs num_iterations+1 times so that we can eval/save at the end
     flops_so_far = num_flops_per_token * args.total_batch_size * step
 
-    # once in a while: evaluate the val bpb (all ranks participate)
-    if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
-        model.eval()
-        val_loader = build_val_loader()
-        eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
-        with autocast_ctx:
-            val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
-        print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
-        if val_bpb < min_val_bpb:
-            min_val_bpb = val_bpb
-        # wandb_run.log({
-        #     "step": step,
-        #     "total_training_flops": flops_so_far,
-        #     "total_training_time": total_training_time,
-        #     "val/bpb": val_bpb,
-        # })
-        tb_logger.add_scalar("val/bpb", val_bpb, step)
-        model.train()
+    # # once in a while: evaluate the val bpb (all ranks participate)
+    # if args.eval_every > 0 and (last_step or step % args.eval_every == 0):
+    #     model.eval()
+    #     val_loader = build_val_loader()
+    #     eval_steps = args.eval_tokens // (args.device_batch_size * args.max_seq_len * ddp_world_size)
+    #     with autocast_ctx:
+    #         val_bpb = evaluate_bpb(model, val_loader, eval_steps, token_bytes)
+    #     print0(f"Step {step:05d} | Validation bpb: {val_bpb:.6f}")
+    #     if val_bpb < min_val_bpb:
+    #         min_val_bpb = val_bpb
+    #     # wandb_run.log({
+    #     #     "step": step,
+    #     #     "total_training_flops": flops_so_far,
+    #     #     "total_training_time": total_training_time,
+    #     #     "val/bpb": val_bpb,
+    #     # })
+    #     tb_logger.add_scalar("val/bpb", val_bpb, step)
+    #     model.train()
 
-    # once in a while: estimate the CORE metric (all ranks participate)
-    # use the original uncompiled model because the inputs keep changing shape
-    results = {}
-    if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
-        model.eval()
-        with autocast_ctx:
-            results = evaluate_model(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
-        print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
-        # wandb_run.log({
-        #     "step": step,
-        #     "total_training_flops": flops_so_far,
-        #     "core_metric": results["core_metric"],
-        #     "centered_results": results["centered_results"],
-        # })
-        tb_logger.add_scalar("core_metric", results["core_metric"], step)
-        for k, v in results["centered_results"].items():
-            tb_logger.add_scalar(f"centered_results/{k}", v, step)
-        model.train()
+    # # once in a while: estimate the CORE metric (all ranks participate)
+    # # use the original uncompiled model because the inputs keep changing shape
+    # results = {}
+    # if args.core_metric_every > 0 and (last_step or (step > 0 and step % args.core_metric_every == 0)):
+    #     model.eval()
+    #     with autocast_ctx:
+    #         results = evaluate_model(orig_model, tokenizer, device, max_per_task=args.core_metric_max_per_task)
+    #     print0(f"Step {step:05d} | CORE metric: {results['core_metric']:.4f}")
+    #     # wandb_run.log({
+    #     #     "step": step,
+    #     #     "total_training_flops": flops_so_far,
+    #     #     "core_metric": results["core_metric"],
+    #     #     "centered_results": results["centered_results"],
+    #     # })
+    #     tb_logger.add_scalar("core_metric", results["core_metric"], step)
+    #     for k, v in results["centered_results"].items():
+    #         tb_logger.add_scalar(f"centered_results/{k}", v, step)
+    #     model.train()
 
-    # once in a while: sample from the model (only on master process)
-    # use the original uncompiled model because the inputs keep changing shape
-    if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
-        model.eval()
-        prompts = [
-            "The capital of France is",
-            "The chemical symbol of gold is",
-            "If yesterday was Friday, then tomorrow will be",
-            "The opposite of hot is",
-            "The planets of the solar system are:",
-            "My favorite color is",
-            "If 5*x + 3 = 13, then x is",
-        ]
-        engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
-        for prompt in prompts:
-            tokens = tokenizer(prompt, prepend="<|bos|>")
-            with autocast_ctx:
-                # sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
-                for token in model.generate(tokens, max_tokens=16, temperature=0):
-                    tokens.append(token)
-            print0(tokenizer.decode(tokens))
-        model.train()
+    # # once in a while: sample from the model (only on master process)
+    # # use the original uncompiled model because the inputs keep changing shape
+    # if args.sample_every > 0 and master_process and (last_step or (step > 0 and step % args.sample_every == 0)):
+    #     model.eval()
+    #     prompts = [
+    #         "The capital of France is",
+    #         "The chemical symbol of gold is",
+    #         "If yesterday was Friday, then tomorrow will be",
+    #         "The opposite of hot is",
+    #         "The planets of the solar system are:",
+    #         "My favorite color is",
+    #         "If 5*x + 3 = 13, then x is",
+    #     ]
+    #     engine = Engine(orig_model, tokenizer) # use orig_model to avoid recompilation
+    #     for prompt in prompts:
+    #         tokens = tokenizer(prompt, prepend="<|bos|>")
+    #         with autocast_ctx:
+    #             # sample, _ = engine.generate_batch(tokens, num_samples=1, max_tokens=16, temperature=0)
+    #             for token in model.generate(tokens, max_tokens=16, temperature=0):
+    #                 tokens.append(token)
+    #         print0(tokenizer.decode(tokens))
+    #     model.train()
 
     # save checkpoint: at the end of the run, or every save_every steps, except at the first step or the resume step
     if last_step or (step > 0 and step != args.resume_from_step and args.save_every > 0 and step % args.save_every == 0):
@@ -350,14 +367,14 @@ while True:
             [opt.state_dict() for opt in optimizers], # optimizer states
             { # metadata saved as json
                 "step": step,
-                "val_bpb": val_bpb, # loss at last step
+                # "val_bpb": val_bpb, # loss at last step
                 "model_config": model_config_kwargs,
                 "user_config": user_config, # inputs to the training script
                 "device_batch_size": args.device_batch_size,
                 "max_seq_len": args.max_seq_len,
                 "dataloader_state_dict": dataloader_state_dict,
                 "loop_state": { # all loop state (other than step) so that we can resume training
-                    "min_val_bpb": min_val_bpb,
+                    # "min_val_bpb": min_val_bpb,
                     "smooth_train_loss": smooth_train_loss,
                     "smooth_train_scalars": smooth_train_scalars,
                     "total_training_time": total_training_time,
@@ -394,6 +411,13 @@ while True:
         group["weight_decay"] = muon_weight_decay
     for opt in optimizers:
         opt.step()
+    # ema update
+    ema_params = itertools.chain(model.ema_wte.parameters(), model.ema_encoder.parameters())
+    src_params = itertools.chain(model.wte.parameters(), model.encoder.parameters())
+    ema_momentum = get_ema_momentum(step)
+    for ema_param, src_param in zip(ema_params, src_params):
+        ema_param.data.mul_(ema_momentum)
+        ema_param.data.add_((1 - ema_momentum) * src_param.data)
     model.zero_grad(set_to_none=True)
     train_loss_f = train_loss.item() # .item() is a CPU-GPU sync point
     synchronize()
@@ -437,6 +461,7 @@ while True:
             "train/tok_per_sec": tok_per_sec,
             "train/mfu": mfu,
             "train/epoch": epoch,
+            "ema_momentum": ema_momentum,
         }
         # wandb_run.log(log_data)
         for k, v in log_data.items():
@@ -448,8 +473,8 @@ while True:
 # print a few more stats
 print0(f"Peak memory usage: {get_max_memory() / 1024 / 1024:.2f}MiB")
 print0(f"Total training time: {total_training_time/60:.2f}m")
-if val_bpb is not None:
-    print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
+# if val_bpb is not None:
+#     print0(f"Minimum validation bpb: {min_val_bpb:.6f}")
 
 # Log to report
 from nanochat.report import get_report
@@ -467,9 +492,9 @@ get_report().log(section="Base model training", data=[
         "final_lr_frac": args.final_lr_frac,
     },
     { # stats about training outcomes
-        "Minimum validation bpb": min_val_bpb if val_bpb is not None else None,
-        "Final validation bpb": val_bpb,
-        "CORE metric estimate": results.get("core_metric", None),
+        # "Minimum validation bpb": min_val_bpb if val_bpb is not None else None,
+        # "Final validation bpb": val_bpb,
+        # "CORE metric estimate": results.get("core_metric", None),
         "MFU %": f"{mfu:.2f}%",
         "Total training flops": f"{flops_so_far:e}",
         "Total training time": f"{total_training_time/60:.2f}m",
