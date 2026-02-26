@@ -2,8 +2,6 @@ from functools import partial
 from dataclasses import dataclass
 from typing import Sequence, Tuple
 import itertools
-import math
-from copy import deepcopy
 
 import torch
 import torch.nn as nn
@@ -25,7 +23,6 @@ class ULMConfig:
     n_head: int = 16 # number of query heads
     n_kv_head: int = 16 # number of key/value heads (GQA)
     n_embd: int = 2048
-    n_cluster: int = 16384
 
 
 def count_params(module):
@@ -123,13 +120,6 @@ class Block(nn.Module):
         return x
 
 
-def reduced_sum(*args, **kwargs):
-    summed = torch.sum(*args, **kwargs)
-    if torch.distributed.is_initialized():
-        torch.distributed.all_reduce(summed)
-    return summed
-
-
 class ULM(nn.Module):
     def __init__(self, config, pad_vocab_size_to=64):
         """
@@ -145,35 +135,31 @@ class ULM(nn.Module):
         padded_vocab_size = ((config.vocab_size + pad_vocab_size_to - 1) // pad_vocab_size_to) * pad_vocab_size_to
         if padded_vocab_size != config.vocab_size:
             print0(f"Padding vocab_size from {config.vocab_size} to {padded_vocab_size} for efficiency")
-        self.wte = nn.Embedding(padded_vocab_size, config.n_embd)
+        self.wte = nn.Embedding(padded_vocab_size, config.n_embd[0])
         self.encoder = nn.ModuleDict({})
         self.decoder = nn.ModuleDict({})
-        self.fsq = nn.ModuleDict({})
         for stage_idx in range(self.n_stage):
             encoder_n_layer, decoder_n_layer = config.n_layer[stage_idx]
             self.encoder[f"transformer_{stage_idx}"] = nn.ModuleList([
-                Block(config.n_head, config.n_kv_head, config.n_embd, layer_idx)
+                Block(config.n_head[stage_idx], config.n_kv_head[stage_idx], config.n_embd[stage_idx], layer_idx)
                 for layer_idx in range(encoder_n_layer)
             ])
             self.decoder[f"transformer_{stage_idx}"] = nn.ModuleList([
-                Block(config.n_head, config.n_kv_head, config.n_embd, layer_idx)
+                Block(config.n_head[stage_idx], config.n_kv_head[stage_idx], config.n_embd[stage_idx], layer_idx)
                 for layer_idx in range(decoder_n_layer)
             ])
             if stage_idx > 0:
-                self.encoder[f"head_{stage_idx}"] = nn.Linear(config.n_embd, config.n_cluster, bias=False)
-                self.decoder[f"head_{stage_idx}"] = nn.Linear(config.n_embd, config.n_cluster, bias=False)
-                self.decoder[f"weight_{stage_idx}"] = nn.Linear(config.n_embd, config.n_embd, bias=False)
-                self.decoder[f"bias_{stage_idx}"] = nn.Embedding(config.n_cluster, config.n_embd)
-        self.ema_wte = deepcopy(self.wte)
-        self.ema_encoder = deepcopy(self.encoder)
-        self.lm_head = nn.Linear(config.n_embd, padded_vocab_size, bias=False)
+                self.decoder[f"head_{stage_idx}"] = nn.Linear(config.n_embd[stage_idx], 2 * config.n_embd[stage_idx], bias=False)
+        self.lm_head = nn.Linear(config.n_embd[0], padded_vocab_size, bias=False)
 
         # To support meta device initialization, we init the rotary embeddings here, but it's just "fake" meta tensors only.
         # As for rotary_seq_len, these rotary embeddings are pretty small/cheap in memory,
         # so let's just over-compute them by 10X, but assert fail if we ever reach that amount.
         # In the future we can dynamically grow the cache, for now it's fine.
         self.rotary_seq_len = config.sequence_len * 10 # 10X over-compute should be enough, TODO make nicer?
-        head_dim = config.n_embd // config.n_head
+        for stage_idx in range(self.n_stage):
+            assert config.n_embd[stage_idx] // config.n_head[stage_idx] == config.n_embd[0] // config.n_head[0]
+        head_dim = config.n_embd[0] // config.n_head[0]
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False) # persistent=False means it's not saved to the checkpoint
         self.register_buffer("sin", sin, persistent=False)
@@ -200,8 +186,7 @@ class ULM(nn.Module):
 
         # Encoder, decoder
         for stage_idx in range(self.n_stage):
-            n_embd = self.config.n_embd
-            s = 3**0.5 * n_embd**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
+            s = 3**0.5 * self.config.n_embd[stage_idx]**-0.5 # sqrt(3) multiplier makes sure Uniform achieves the same std as Normal
             for block in itertools.chain(self.encoder[f"transformer_{stage_idx}"],
                                          self.decoder[f"transformer_{stage_idx}"]):
                 torch.nn.init.uniform_(block.attn.c_q.weight, -s, s) # weights use Uniform to avoid outliers
@@ -211,19 +196,10 @@ class ULM(nn.Module):
                 torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
                 torch.nn.init.zeros_(block.mlp.c_proj.weight)
             if stage_idx > 0:
-                torch.nn.init.normal_(self.encoder[f"head_{stage_idx}"].weight, mean=0.0, std=0.001)
-                torch.nn.init.normal_(self.decoder[f"head_{stage_idx}"].weight, mean=0.0, std=0.001)
-                torch.nn.init.zeros_(self.decoder[f"weight_{stage_idx}"].weight)
-                torch.nn.init.zeros_(self.decoder[f"bias_{stage_idx}"].weight)
-
-        # EMA embedding and encoder
-        ema_params = itertools.chain(self.ema_wte.parameters(), self.ema_encoder.parameters())
-        src_params = itertools.chain(self.wte.parameters(), self.encoder.parameters())
-        for ema_param, src_param in zip(ema_params, src_params):
-            ema_param.data.copy_(src_param.data)
+                torch.nn.init.zeros_(self.decoder[f"head_{stage_idx}"].weight)
 
         # Rotary embeddings
-        head_dim = self.config.n_embd // self.config.n_head
+        head_dim = self.config.n_embd[0] // self.config.n_head[0]
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
 
@@ -258,15 +234,12 @@ class ULM(nn.Module):
             nparams += count_params(self.decoder[f"transformer_{stage_idx}"])
             if stage_idx > 0:
                 nparams += count_params(self.decoder[f"head_{stage_idx}"])
-                nparams += count_params(self.decoder[f"weight_{stage_idx}"])
-                nparams += count_params(self.decoder[f"bias_{stage_idx}"])
-            h, q, t, l = (
-                self.config.n_head,
-                self.config.n_embd // self.config.n_head,
-                self.config.sequence_len / 2 ** stage_idx,
-                sum(self.config.n_layer[stage_idx])
+            h, q, t = (
+                self.config.n_head[stage_idx],
+                self.config.n_embd[stage_idx] // self.config.n_head[stage_idx],
+                self.config.sequence_len / 2 ** stage_idx
             )
-            attn_flops = 12 * h * q * t * l
+            attn_flops = 12 * h * q * t
             num_flops_per_token += (6 * nparams + attn_flops) / 2 ** stage_idx
         num_flops_per_token += 6 * count_params(self.lm_head)
         return num_flops_per_token
@@ -282,25 +255,20 @@ class ULM(nn.Module):
         """
         return count_params(self)
 
-    def setup_optimizers(self, embedding_lr=0.2, unembedding_lr=0.004, proj_lr=0.004, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95)):
-        model_dim = self.config.n_embd
+    def setup_optimizers(self, embedding_lr=0.2, unembedding_lr=0.004, matrix_lr=0.02, weight_decay=0.0, adam_betas=(0.8, 0.95)):
+        model_dim = self.config.n_embd[0]
         ddp, rank, local_rank, world_size = get_dist_info()
         # Separate out all parameters into groups
         embedding_params = list(self.wte.parameters())
         matrix_params = []
         head_params = []
-        proj_params = []
         for stage in range(self.n_stage):
             matrix_params.extend(list(self.encoder[f"transformer_{stage}"].parameters()))
             matrix_params.extend(list(self.decoder[f"transformer_{stage}"].parameters()))
             if stage > 0:
-                head_params.extend(list(self.encoder[f"head_{stage}"].parameters()))
                 head_params.extend(list(self.decoder[f"head_{stage}"].parameters()))
-                proj_params.extend(list(self.decoder[f"weight_{stage}"].parameters()))
-                proj_params.extend(list(self.decoder[f"bias_{stage}"].parameters()))
         head_params.extend(list(self.lm_head.parameters()))
-        ema_params = list(self.ema_wte.parameters()) + list(self.ema_encoder.parameters())
-        assert len(list(self.parameters())) == len(embedding_params) + len(matrix_params) + len(head_params) + len(proj_params) + len(ema_params)
+        assert len(list(self.parameters())) == len(embedding_params) + len(matrix_params) + len(head_params)
         # Create the AdamW optimizer for the embedding, pool, unpool, and lm_head layers
         # Scale the LR for the AdamW parameters by ∝1/√dmodel (having tuned the LRs for 768 dim model)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -308,7 +276,6 @@ class ULM(nn.Module):
         adam_groups = [
             dict(params=embedding_params, lr=embedding_lr * dmodel_lr_scale),
             dict(params=head_params, lr=unembedding_lr * dmodel_lr_scale),
-            dict(params=proj_params, lr=proj_lr * dmodel_lr_scale),
         ]
         adamw_kwargs = dict(betas=adam_betas, eps=1e-10, weight_decay=0.0) # NOTE: weight decay is hardcoded to 0.0 for AdamW, only used in Muon
         AdamWFactory = DistAdamW if ddp else partial(torch.optim.AdamW, fused=True)
@@ -324,18 +291,8 @@ class ULM(nn.Module):
                 group["initial_lr"] = group["lr"]
         return optimizers
 
-    def forward(self, idx, targets=None, kv_cache=None):
-        assert targets is not None
-
+    def forward(self, idx, targets=None, tau=0.5, kv_cache=None, loss_reduction='mean'):
         B, T = idx.size()
-        # Truncate the input and targets to the nearest multiple of 2 ** (self.n_stage - 1)
-        remainder = T % 2 ** (self.n_stage - 1)
-        if remainder > 0:
-            idx = idx[:, :-remainder]
-            targets = targets[:, :-remainder]
-            T -= remainder
-        # Ensure the sequence length is at least 2 * 2 ** (self.n_stage - 1)
-        assert T >= 2 * 2 ** (self.n_stage - 1)
 
         # Grab the rotary embeddings for the current sequence length (they are of shape (1, seq_len, 1, head_dim/2))
         assert T <= self.cos.size(1), f"Sequence length grew beyond the rotary embeddings cache: {T} > {self.cos.size(1)}"
@@ -344,25 +301,26 @@ class ULM(nn.Module):
         # if kv cache exists, we need to offset the rotary embeddings to the current position in the cache
         T0 = 0 if kv_cache is None else kv_cache.get_pos()
         cos_sin = self.cos[:, T0:T0+T], self.sin[:, T0:T0+T] # truncate cache to current sequence length
-
+        
         def pool_cos_sin(cos, sin, stage_idx):
             return (
                 cos[:, (2 ** stage_idx - 1)::(2 ** stage_idx)],
                 sin[:, (2 ** stage_idx - 1)::(2 ** stage_idx)]
             )
 
-        def truncate_cos_sin(cos, sin, seq_len):
-            return cos[:, :seq_len], sin[:, :seq_len]
-
-        # Embedding and encoder
+        # Input embed
         x = self.wte(idx)
         x = norm(x)
+
+        # Encoder
         encoder_outputs = []
         for stage_idx in range(self.n_stage):
             if stage_idx > 0:
-                assert x.size(1) > 1
+                if x.size(1) == 1:
+                    break
                 # Pool
-                assert x.size(1) % 2 == 0
+                if x.size(1) % 2 == 1:
+                    x = x[:, :-1]
                 assert x.size(2) % 2 == 0
                 x = x[:, :, ::2]
                 x = x.view(B, x.size(1) // 2, x.size(2) * 2)
@@ -373,104 +331,69 @@ class ULM(nn.Module):
                 x = block(x, pooled_cos_sin, kv_cache)
             encoder_outputs.append(x)
 
-        # EMA embedding and encoder
-        with torch.no_grad():
-            x = self.ema_wte(idx)
-            x = norm(x)
-            ema_encoder_outputs = []
-            for stage_idx in range(self.n_stage):
-                if stage_idx > 0:
-                    assert x.size(1) > 1
-                    # Pool
-                    assert x.size(1) % 2 == 0
-                    assert x.size(2) % 2 == 0
-                    x = x[:, :, ::2]
-                    x = x.view(B, x.size(1) // 2, x.size(2) * 2)
-
-                # Stage
-                pooled_cos_sin = pool_cos_sin(*cos_sin, stage_idx)
-                for block in self.ema_encoder[f"transformer_{stage_idx}"]:
-                    x = block(x, pooled_cos_sin, kv_cache)
-                ema_encoder_outputs.append(x)
-
         # Decoder
-        x = encoder_outputs[-1]
-        x = x[:, :-1]
-        encoder_head_losses = []
-        kl_losses = []
-        scalars = {}
         for stage_idx in reversed(range(len(encoder_outputs))):
             # Stage
             pooled_cos_sin = pool_cos_sin(*cos_sin, stage_idx)
-            truncated_cos_sin = truncate_cos_sin(*pooled_cos_sin, x.size(1))
             for block in self.decoder[f"transformer_{stage_idx}"]:
-                x = block(x, truncated_cos_sin, kv_cache)
+                x = block(x, pooled_cos_sin, kv_cache)
             x = norm(x)
 
             if stage_idx > 0:
-                # Encoder head
-                y = ema_encoder_outputs[stage_idx]
-                slc = slice(2 ** (self.n_stage - stage_idx - 1), None)
-                y = y[:, slc]
-                y = norm(y)
-                encoder_logits = self.encoder[f"head_{stage_idx}"](y)
-                t = encoder_logits.size(1)
-                encoder_logits = encoder_logits.view(-1, encoder_logits.size(-1))
-                with torch.no_grad():
-                    soft_assignments = torch.softmax(encoder_logits.detach() / 0.5, dim=-1)
-                    eps = 1e-8
-                    for _ in range(3):
-                        soft_assignments /= reduced_sum(soft_assignments, dim=-2, keepdim=True) + eps
-                        soft_assignments /= torch.sum(soft_assignments, dim=-1, keepdim=True) + eps
-                    hard_assignments = torch.multinomial(soft_assignments, num_samples=1).squeeze(-1).view(B, t)
-                encoder_head_loss = F.cross_entropy(encoder_logits, soft_assignments)
-                encoder_head_losses.append(encoder_head_loss)
-                scalars[f"encoder_head_loss_{stage_idx}"] = encoder_head_loss.detach()
-
-                # Decoder head
-                decoder_logits = self.decoder[f"head_{stage_idx}"](x)
-                decoder_log_probs = F.log_softmax(decoder_logits, dim=-1)
-                assert decoder_log_probs.size(1) == t
-                decoder_log_probs = decoder_log_probs.view(-1, decoder_log_probs.size(-1))
-                kl_loss = F.kl_div(decoder_log_probs, soft_assignments, reduction="batchmean") * t / T
-                kl_losses.append(kl_loss)
-                scalars[f"kl_loss_{stage_idx}"] = kl_loss.detach()
-                
-                with torch.no_grad():
-                    assign_entropy = torch.mean(torch.sum(-torch.xlogy(soft_assignments, soft_assignments), dim=-1))
-                    scalars[f"assign_entropy_{stage_idx}"] = assign_entropy.detach()
-
-                # Skip-connection
+                # Head, shift & skip-connection
+                x = self.decoder[f"head_{stage_idx}"](x)
+                x = x.view(B, x.size(1) * 2, x.size(2) // 2)
                 y = encoder_outputs[stage_idx - 1]
-                slc = slice(2 ** (self.n_stage - stage_idx) - 1, -1)
-                y = y[:, slc]
-                x = self.decoder[f"weight_{stage_idx}"](x)
-                b = self.decoder[f"bias_{stage_idx}"].weight[hard_assignments]
-                assert b.size() == x.size()
-                x = x + b
-                x = y + torch.repeat_interleave(x, 2, dim=1)
+                if x.size(1) == y.size(1):
+                    x = x[:, :-1]
+                assert x.size(1) == y.size(1) - 1
+                shifted_x = torch.zeros_like(y)
+                shifted_x[:, 1:] = x
+                x = y + shifted_x
 
         # Forward the lm_head (compute logits)
+        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = self.lm_head(x) # (B, T, padded_vocab_size) <- very big tensor, large amount of memory
         logits = logits[..., :self.config.vocab_size] # slice to remove padding
         logits = logits.float() # switch to fp32 for logit softcap and loss computation
-        softcap = 15 # smoothly cap the logits to the range [-softcap, softcap]
         logits = softcap * torch.tanh(logits / softcap) # squash the logits
 
-        slc = slice(2 ** (self.n_stage - 1) - 1, -1)
-        targets = targets[:, slc].contiguous()
-        assert logits.size(1) == targets.size(1)
-        recon_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
-        scalars["recon_loss"] = recon_loss.detach()
-
-        kl_loss = torch.sum(torch.stack(kl_losses))
-        elbo = recon_loss + kl_loss
-        scalars["elbo"] = elbo.detach()
-
-        encoder_head_loss = torch.sum(torch.stack(encoder_head_losses))
-        loss = elbo + encoder_head_loss
-        return loss, scalars
+        if targets is not None:
+            # training: given the targets, compute and return the loss
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1, reduction=loss_reduction)
+            scalars = {}
+            return loss, scalars
+        else:
+            # inference: just return the logits directly
+            return logits
 
     @torch.inference_mode()
     def generate(self, tokens, max_tokens, temperature=1.0, top_k=None, seed=42):
-        raise NotImplementedError("Generation is not implemented for ULM")
+        """
+        Naive autoregressive streaming inference.
+        To make it super simple, let's assume:
+        - batch size is 1
+        - ids and the yielded tokens are simple Python lists and ints
+        """
+        assert isinstance(tokens, list)
+        device = self.get_device()
+        rng = None
+        if temperature > 0:
+            rng = torch.Generator(device=device)
+            rng.manual_seed(seed)
+        ids = torch.tensor([tokens], dtype=torch.long, device=device) # add batch dim
+        for _ in range(max_tokens):
+            logits = self.forward(ids) # (B, T, vocab_size)
+            logits = logits[:, -1, :] # (B, vocab_size)
+            if top_k is not None:
+                v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                logits[logits < v[:, [-1]]] = -float('Inf')
+            if temperature > 0:
+                logits = logits / temperature
+                probs = F.softmax(logits, dim=-1)
+                next_ids = torch.multinomial(probs, num_samples=1, generator=rng)
+            else:
+                next_ids = torch.argmax(logits, dim=-1, keepdim=True)
+            ids = torch.cat((ids, next_ids), dim=1)
+            token = next_ids.item()
+            yield token
